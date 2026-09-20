@@ -507,6 +507,8 @@ main(int argc, char **argv)
 	global_environ = environ_create();
 	for (var = environ; *var != NULL; var++)
 		environ_put(global_environ, *var, 0);
+	/* Only tmux's copy: libsystemd reads the real environment. */
+	environ_unset_systemd(global_environ);
 	if ((cwd = find_cwd()) != NULL)
 		environ_set(global_environ, "PWD", 0, "%s", cwd);
 	expand_paths(TMUX_CONF, &cfg_files, &cfg_nfiles, 1);
