@@ -392,6 +392,45 @@ grid_create(u_int sx, u_int sy, u_int hlimit)
 	return (gd);
 }
 
+/* Create a grid with history already in it. */
+struct grid *
+grid_restart_create(u_int sx, u_int sy, u_int hlimit, u_int hsize)
+{
+	struct grid	*gd;
+
+	gd = grid_create(sx, sy, hlimit);
+	if (hsize != 0) {
+		grid_adjust_lines(gd, hsize + sy);
+		memmove(&gd->linedata[hsize], &gd->linedata[0],
+		    sy * (sizeof *gd->linedata));
+		memset(&gd->linedata[0], 0, hsize * (sizeof *gd->linedata));
+		gd->hsize = hsize;
+	}
+	return (gd);
+}
+
+/*
+ * Set a cell, keeping GRID_FLAG_CLEARED, which grid_set_cell drops because
+ * nothing that writes a cell in the ordinary way can produce it.
+ */
+void
+grid_restart_set_cell(struct grid *gd, u_int px, u_int py,
+    const struct grid_cell *gc)
+{
+	struct grid_line	*gl;
+
+	grid_set_cell(gd, px, py, gc);
+	if (~gc->flags & GRID_FLAG_CLEARED)
+		return;
+	if (grid_check_y(gd, __func__, py) != 0)
+		return;
+	gl = &gd->linedata[py];
+	gl->celldata[px].flags |= GRID_FLAG_CLEARED;
+	if (gl->celldata[px].flags & GRID_FLAG_EXTENDED)
+		gl->extddata[gl->celldata[px].offset].flags |=
+		    GRID_FLAG_CLEARED;
+}
+
 /* Destroy grid. */
 void
 grid_destroy(struct grid *gd)

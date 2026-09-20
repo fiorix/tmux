@@ -845,3 +845,193 @@ session_update_history(struct session *s)
 		}
 	}
 }
+
+/*
+ * Takes ownership of env and oo only on success; on failure they are left for
+ * the caller to discard, because the partially built session is freed here.
+ */
+int
+session_restart_create(struct sessions *root, uint32_t id, const char *name,
+    const char *cwd, struct environ *env, struct options *oo,
+    const struct termios *tio, struct session **out, char **cause)
+{
+	struct session	*s;
+
+	*out = NULL;
+	s = xcalloc(1, sizeof *s);
+	s->references = 1;
+	s->flags = 0;
+	s->attached = 0;
+
+	s->cwd = xstrdup(cwd);
+	s->name = xstrdup(name);
+
+	TAILQ_INIT(&s->lastw);
+	RB_INIT(&s->windows);
+
+	s->environ = env;
+	s->options = oo;
+	s->id = id;
+	s->curw = NULL;
+	s->tio = NULL;
+	if (tio != NULL) {
+		s->tio = xcalloc(1, sizeof *s->tio);
+		memcpy(s->tio, tio, sizeof *s->tio);
+	}
+
+	status_update_cache(s);
+
+	if (RB_INSERT(sessions, root, s) != NULL) {
+		xasprintf(cause, "duplicate restart session");
+		goto fail;
+	}
+
+	*out = s;
+	return (0);
+
+fail:
+	free(s->tio);
+	free(s->name);
+	free((void *)s->cwd);
+	free(s);
+	return (-1);
+}
+
+/* Create an empty session group under the given root. */
+int
+session_group_restart_create(struct session_groups *root, const char *name,
+    struct session_group **out, char **cause)
+{
+	struct session_group	*sg;
+
+	*out = NULL;
+	sg = xcalloc(1, sizeof *sg);
+	sg->name = xstrdup(name);
+	TAILQ_INIT(&sg->sessions);
+	if (RB_INSERT(session_groups, root, sg) != NULL) {
+		xasprintf(cause, "duplicate restart session group");
+		free((void *)sg->name);
+		free(sg);
+		return (-1);
+	}
+	*out = sg;
+	return (0);
+}
+
+/* Put a session in a group without the naming and ordering of the live path. */
+void
+session_group_restart_add(struct session_group *sg, struct session *s)
+{
+	TAILQ_INSERT_TAIL(&sg->sessions, s, gentry);
+}
+
+/* Link a window into a session at an index the caller has already chosen. */
+int
+winlink_restart_create(struct session *s, struct window *w, int idx,
+    int flags, struct winlink **out, char **cause)
+{
+	struct winlink	*wl;
+
+	*out = NULL;
+	wl = xcalloc(1, sizeof *wl);
+	wl->idx = idx;
+	wl->session = s;
+	wl->flags = flags;
+	if (RB_INSERT(winlinks, &s->windows, wl) != NULL) {
+		xasprintf(cause, "duplicate restart winlink index");
+		free(wl);
+		return (-1);
+	}
+	TAILQ_INSERT_TAIL(&w->winlinks, wl, wentry);
+	wl->window = w;
+	w->references++;
+
+	*out = wl;
+	return (0);
+}
+
+/* Unlink a winlink from a session and return the window it referenced. */
+static struct window *
+winlink_restart_remove(struct winlinks *wwl, struct winlink *wl)
+{
+	struct window	*w = wl->window;
+
+	if (w != NULL) {
+		TAILQ_REMOVE(&w->winlinks, wl, wentry);
+		w->references--;
+	}
+	RB_REMOVE(winlinks, wwl, wl);
+	free(wl);
+	return (w);
+}
+
+/* Unlink a winlink, moving the current window on if it was the one. */
+struct window *
+session_restart_unlink(struct session *s, struct winlink *wl)
+{
+	struct winlink	*loop, *next = NULL, *previous = NULL;
+
+	winlink_stack_remove(&s->lastw, wl);
+	if (s->curw == wl) {
+		s->curw = NULL;
+		next = TAILQ_FIRST(&s->lastw);
+		if (next != NULL) {
+			winlink_stack_remove(&s->lastw, next);
+			s->curw = next;
+		} else {
+			RB_FOREACH(loop, winlinks, &s->windows) {
+				if (loop == wl)
+					break;
+				previous = loop;
+			}
+			if (previous == NULL) {
+				previous = RB_MAX(winlinks, &s->windows);
+				if (previous == wl)
+					previous = NULL;
+			}
+			s->curw = previous;
+		}
+	}
+	return (winlink_restart_remove(&s->windows, wl));
+}
+
+/* Tear down a candidate session and everything reached only through it. */
+void
+session_restart_destroy(struct sessions *root, struct session_groups *groups,
+    struct session *s)
+{
+	struct session_group	*sg, *found = NULL;
+	struct session		*loop;
+	struct winlink		*wl, *wl1;
+
+	RB_FOREACH(sg, session_groups, groups) {
+		TAILQ_FOREACH(loop, &sg->sessions, gentry) {
+			if (loop == s) {
+				found = sg;
+				break;
+			}
+		}
+		if (found != NULL)
+			break;
+	}
+	if (found != NULL) {
+		TAILQ_REMOVE(&found->sessions, s, gentry);
+		if (TAILQ_EMPTY(&found->sessions)) {
+			RB_REMOVE(session_groups, groups, found);
+			free((void *)found->name);
+			free(found);
+		}
+	}
+
+	RB_FOREACH_SAFE(wl, winlinks, &s->windows, wl1)
+		winlink_restart_remove(&s->windows, wl);
+	TAILQ_INIT(&s->lastw);
+
+	RB_REMOVE(sessions, root, s);
+	environ_free(s->environ);
+	options_free(s->options);
+	free(s->tio);
+	free(s->name);
+	free((void *)s->cwd);
+	free(s);
+}

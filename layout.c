@@ -2058,3 +2058,185 @@ layout_insert_tile(struct window *w, struct layout_cell *lc)
 
 	return (0);
 }
+
+/*
+ * Releases a candidate layout tree through the graph allocator, so a rolled
+ * back apply discharges the ledger. The ordinary layout_free_cell is correct
+ * after publication, where the discharge has already cleared these entries.
+ */
+void
+layout_restart_free_cell(struct layout_cell *lc)
+{
+	struct layout_cell	*lcchild, *lcnext;
+
+	if (lc == NULL)
+		return;
+
+	switch (lc->type) {
+	case LAYOUT_LEFTRIGHT:
+	case LAYOUT_TOPBOTTOM:
+		lcchild = TAILQ_FIRST(&lc->cells);
+		while (lcchild != NULL) {
+			lcnext = TAILQ_NEXT(lcchild, entry);
+			TAILQ_REMOVE(&lc->cells, lcchild, entry);
+			layout_restart_free_cell(lcchild);
+			lcchild = lcnext;
+		}
+		break;
+	case LAYOUT_WINDOWPANE:
+		if (lc->wp != NULL) {
+			if (lc->wp->layout_cell == lc)
+				lc->wp->layout_cell = NULL;
+			if (lc->wp->saved_layout_cell == lc)
+				lc->wp->saved_layout_cell = NULL;
+		}
+		break;
+	}
+
+	free(lc);
+}
+
+/*
+ * Candidate forms of the layout close path.
+ *
+ * These differ from the live ones in two ways: cells are released through
+ * layout_restart_free_cell so the transaction ledger sees them, and nothing
+ * is redrawn, announced or resized. Geometry is repaired but no resize record
+ * is produced, because final dimensions are not known until scrollbar widths
+ * have been derived, and a record staged against intermediate dimensions
+ * would carry the wrong old size to the child.
+ *
+ * Removal also repairs the saved tree, which layout_close_pane does not. A
+ * restored window can arrive zoomed, carrying a serialized saved tree that
+ * references the pane being removed, and there is no later unzoom to reconcile
+ * it against.
+ */
+void
+layout_restart_fix_panes(struct window *w)
+{
+	struct window_pane	*wp;
+	struct layout_cell	*lc, *root = w->layout_root;
+	int			 status, sb_w, sb_pad;
+	u_int			 sx, sy;
+
+	TAILQ_FOREACH(wp, &w->panes, entry) {
+		if ((lc = wp->layout_cell) == NULL)
+			continue;
+
+		wp->xoff = lc->g.xoff;
+		wp->yoff = lc->g.yoff;
+		sx = lc->g.sx;
+		sy = lc->g.sy;
+
+		status = window_pane_get_pane_status(wp);
+		if (!window_pane_is_floating(wp) &&
+		    layout_add_horizontal_border(root, lc, status)) {
+			if (status == PANE_STATUS_TOP)
+				wp->yoff++;
+			if (sy > 1)
+				sy--;
+		}
+
+		if (window_pane_scrollbar_reserve(wp)) {
+			sb_w = wp->scrollbar_style.width;
+			sb_pad = wp->scrollbar_style.pad;
+			if (sb_w < 1)
+				sb_w = 1;
+			if (sb_pad < 0)
+				sb_pad = 0;
+			if (w->sb_pos == PANE_SCROLLBARS_LEFT) {
+				if ((int)sx - sb_w - sb_pad < PANE_MINIMUM) {
+					wp->xoff = wp->xoff +
+					    (int)sx - PANE_MINIMUM;
+					sx = PANE_MINIMUM;
+				} else {
+					sx = sx - sb_w - sb_pad;
+					wp->xoff = wp->xoff + sb_w + sb_pad;
+				}
+			} else if ((int)sx - sb_w - sb_pad < PANE_MINIMUM)
+				sx = PANE_MINIMUM;
+			else
+				sx = sx - sb_w - sb_pad;
+			wp->flags |= PANE_REDRAWSCROLLBAR;
+		}
+
+		wp->sx = sx;
+		wp->sy = sy;
+	}
+}
+
+/* Remove a cell and collapse its parent, as layout_destroy_cell does. */
+static void
+layout_restart_destroy_cell(struct window *w, struct layout_cell *lc,
+    struct layout_cell **lcroot)
+{
+	struct layout_cell	*lcother, *lcparent;
+	int			 change;
+
+	lcparent = lc->parent;
+	if (lcparent == NULL) {
+		if (*lcroot == lc)
+			*lcroot = NULL;
+		layout_restart_free_cell(lc);
+		return;
+	}
+
+	if (!layout_cell_is_tiled(lc)) {
+		TAILQ_REMOVE(&lcparent->cells, lc, entry);
+		layout_restart_free_cell(lc);
+		goto out;
+	}
+
+	lcother = layout_cell_get_neighbour(lc);
+	if (lcother != NULL) {
+		if (lcparent->type == LAYOUT_LEFTRIGHT)
+			change = lc->g.sx + 1;
+		else
+			change = lc->g.sy + 1;
+		layout_resize_adjust(w, lcother, lcparent->type, change);
+	} else
+		layout_remove_tile(w, lcparent);
+
+	TAILQ_REMOVE(&lcparent->cells, lc, entry);
+	layout_restart_free_cell(lc);
+
+out:
+	lc = TAILQ_FIRST(&lcparent->cells);
+	if (lc != NULL && TAILQ_NEXT(lc, entry) == NULL) {
+		TAILQ_REMOVE(&lcparent->cells, lc, entry);
+
+		lc->parent = lcparent->parent;
+		if (lc->parent == NULL) {
+			if (layout_cell_is_tiled(lc)) {
+				lc->g.xoff = 0;
+				lc->g.yoff = 0;
+			}
+			*lcroot = lc;
+		} else
+			TAILQ_REPLACE(&lc->parent->cells, lcparent, lc, entry);
+
+		layout_restart_free_cell(lcparent);
+	}
+}
+
+/* Take a pane out of the layout it is in, if it is in one. */
+void
+layout_restart_remove_pane(struct window *w, struct window_pane *wp)
+{
+	if (wp->layout_cell == NULL)
+		return;
+
+	layout_restart_destroy_cell(w, wp->layout_cell, &w->layout_root);
+	wp->layout_cell = NULL;
+
+	if (w->saved_layout_root != NULL && wp->saved_layout_cell != NULL) {
+		layout_restart_destroy_cell(w, wp->saved_layout_cell,
+		    &w->saved_layout_root);
+		wp->saved_layout_cell = NULL;
+	}
+
+	if (w->layout_root == NULL)
+		return;
+	layout_fix_offsets(w);
+	layout_restart_fix_panes(w);
+}

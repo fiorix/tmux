@@ -294,7 +294,8 @@ utf8_find_in_width_cache(wchar_t wc)
 
 /* Add to width cache. */
 static void
-utf8_insert_width_cache(wchar_t wc, u_int width)
+utf8_insert_width_cache(struct utf8_width_cache *cache, wchar_t wc,
+    u_int width)
 {
 	struct utf8_width_item	*uw, *old;
 
@@ -305,18 +306,18 @@ utf8_insert_width_cache(wchar_t wc, u_int width)
 	uw->width = width;
 	uw->allocated = 1;
 
-	old = RB_INSERT(utf8_width_cache, &utf8_width_cache, uw);
+	old = RB_INSERT(utf8_width_cache, cache, uw);
 	if (old != NULL) {
-		RB_REMOVE(utf8_width_cache, &utf8_width_cache, old);
+		RB_REMOVE(utf8_width_cache, cache, old);
 		if (old->allocated)
 			free(old);
-		RB_INSERT(utf8_width_cache, &utf8_width_cache, uw);
+		RB_INSERT(utf8_width_cache, cache, uw);
 	}
 }
 
 /* Parse a single codepoint option. */
 static void
-utf8_add_to_width_cache(const char *s)
+utf8_add_to_width_cache(struct utf8_width_cache *cache, const char *s)
 {
 	char			*copy, *cp, *endptr;
 	u_int			 width;
@@ -376,7 +377,7 @@ utf8_add_to_width_cache(const char *s)
 
 		wc = wc_start;
 		for (;;) {
-			utf8_insert_width_cache(wc, width);
+			utf8_insert_width_cache(cache, wc, width);
 			if (wc == wc_end)
 				break;
 			wc++;
@@ -401,7 +402,7 @@ utf8_add_to_width_cache(const char *s)
 		}
 		free(ud);
 
-		utf8_insert_width_cache(wc, width);
+		utf8_insert_width_cache(cache, wc, width);
 	}
 
 	free(copy);
@@ -430,7 +431,8 @@ utf8_update_width_cache(void)
 	o = options_get(global_options, "codepoint-widths");
 	a = options_array_first(o);
 	while (a != NULL) {
-		utf8_add_to_width_cache(options_array_item_value(a)->string);
+		utf8_add_to_width_cache(&utf8_width_cache,
+		    options_array_item_value(a)->string);
 		a = options_array_next(a);
 	}
 }
@@ -1045,4 +1047,83 @@ utf8_cstrhas(const char *s, const struct utf8_data *ud)
 	free(copy);
 
 	return (found);
+}
+
+/* Candidate width cache, built against options that are not yet published. */
+struct utf8_restart_cache {
+	struct utf8_width_cache	tree;
+};
+
+/* Build a width cache from options that are not yet published. */
+struct utf8_restart_cache *
+utf8_restart_prepare_width_cache(struct options *oo)
+{
+	struct utf8_restart_cache	*rc;
+	struct options_entry		*o;
+	struct options_array_item	*a;
+
+	rc = xmalloc(sizeof *rc);
+	RB_INIT(&rc->tree);
+
+	o = options_get(oo, "codepoint-widths");
+	if (o != NULL) {
+		a = options_array_first(o);
+		while (a != NULL) {
+			utf8_add_to_width_cache(&rc->tree,
+			    options_array_item_value(a)->string);
+			a = options_array_next(a);
+		}
+	}
+
+	return (rc);
+}
+
+/* Replace the live width cache with the candidate and free the old one. */
+void
+utf8_restart_commit_width_cache(struct utf8_restart_cache *rc)
+{
+	struct utf8_width_item	*uw, *uw1, *old;
+	u_int			 i;
+
+	if (rc == NULL)
+		return;
+
+	RB_FOREACH_SAFE(uw, utf8_width_cache, &utf8_width_cache, uw1) {
+		RB_REMOVE(utf8_width_cache, &utf8_width_cache, uw);
+		if (uw->allocated)
+			free(uw);
+	}
+
+	for (i = 0; i < nitems(utf8_default_width_cache); i++) {
+		RB_INSERT(utf8_width_cache, &utf8_width_cache,
+		    &utf8_default_width_cache[i]);
+	}
+
+	RB_FOREACH_SAFE(uw, utf8_width_cache, &rc->tree, uw1) {
+		RB_REMOVE(utf8_width_cache, &rc->tree, uw);
+		old = RB_INSERT(utf8_width_cache, &utf8_width_cache, uw);
+		if (old != NULL) {
+			RB_REMOVE(utf8_width_cache, &utf8_width_cache, old);
+			if (old->allocated)
+				free(old);
+			RB_INSERT(utf8_width_cache, &utf8_width_cache, uw);
+		}
+	}
+
+	free(rc);
+}
+
+/* Free a candidate width cache that will not be published. */
+void
+utf8_restart_discard_width_cache(struct utf8_restart_cache *rc)
+{
+	struct utf8_width_item	*uw, *uw1;
+
+	if (rc == NULL)
+		return;
+	RB_FOREACH_SAFE(uw, utf8_width_cache, &rc->tree, uw1) {
+		RB_REMOVE(utf8_width_cache, &rc->tree, uw);
+		free(uw);
+	}
+	free(rc);
 }

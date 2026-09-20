@@ -258,6 +258,46 @@ hyperlinks_limit(void)
 	return (MAX_HYPERLINKS - 1);
 }
 
+/*
+ * Create a set that will be filled with saved hyperlinks. The next number is
+ * taken from the caller so that a restored set keeps the numbers the cells
+ * already refer to.
+ */
+struct hyperlinks *
+hyperlinks_restart_init(u_int next_inner)
+{
+	struct hyperlinks	*hl;
+
+	hl = hyperlinks_init();
+	hl->next_inner = next_inner;
+	return (hl);
+}
+
+/* Add a saved hyperlink with the number and external ID it had. */
+int
+hyperlinks_restart_add(struct hyperlinks *hl, u_int inner, const char *uri,
+    const char *internal_id, const char *external_id)
+{
+	struct hyperlinks_uri	*hlu;
+
+	hlu = xcalloc(1, sizeof *hlu);
+	hlu->inner = inner;
+	hlu->internal_id = xstrdup(internal_id);
+	hlu->external_id = xstrdup(external_id);
+	hlu->uri = xstrdup(uri);
+	hlu->tree = hl;
+
+	if (RB_INSERT(hyperlinks_by_uri_tree, &hl->by_uri, hlu) != NULL ||
+	    RB_INSERT(hyperlinks_by_inner_tree, &hl->by_inner, hlu) != NULL) {
+		free((void *)hlu->uri);
+		free((void *)hlu->external_id);
+		free((void *)hlu->internal_id);
+		free(hlu);
+		return (-1);
+	}
+	return (0);
+}
+
 /* Initialize hyperlink set. */
 struct hyperlinks *
 hyperlinks_init(void)
@@ -298,4 +338,52 @@ hyperlinks_free(struct hyperlinks *hl)
 		hyperlinks_reset(hl);
 		free(hl);
 	}
+}
+
+int
+hyperlinks_restart_preflight(size_t count, char **cause)
+{
+	if (global_hyperlinks_count > hyperlinks_limit() ||
+	    count > hyperlinks_limit() - global_hyperlinks_count) {
+		xasprintf(cause, "global hyperlink limit exceeded");
+		return (-1);
+	}
+	return (0);
+}
+
+/* Enter a prepared set into the global list, which publication makes live. */
+void
+hyperlinks_restart_commit(struct hyperlinks *hl)
+{
+	struct hyperlinks_uri *hlu;
+
+	RB_FOREACH(hlu, hyperlinks_by_inner_tree, &hl->by_inner) {
+		TAILQ_INSERT_TAIL(&global_hyperlinks, hlu, list_entry);
+		global_hyperlinks_count++;
+	}
+}
+
+/* Free a prepared set that will not be published. */
+void
+hyperlinks_restart_discard(struct hyperlinks *hl)
+{
+	struct hyperlinks_uri *hlu, *next;
+
+	if (hl == NULL)
+		return;
+	RB_FOREACH_SAFE(hlu, hyperlinks_by_inner_tree, &hl->by_inner, next) {
+		RB_REMOVE(hyperlinks_by_inner_tree, &hl->by_inner, hlu);
+		RB_REMOVE(hyperlinks_by_uri_tree, &hl->by_uri, hlu);
+		free((void *)hlu->internal_id);
+		free((void *)hlu->external_id);
+		free((void *)hlu->uri);
+		free(hlu);
+	}
+	free(hl);
+}
+
+void
+hyperlinks_restart_set_next_external_id(long long next)
+{
+	hyperlinks_next_external_id = next;
 }

@@ -35,6 +35,8 @@ int restart_terminal_decode(const void *, size_t, struct restart_terminal **,
     char **);
 void restart_terminal_free(struct restart_terminal *);
 
+typedef int (*restart_fd_lookup_cb)(void *, u_int, pid_t, int *);
+
 int restart_state_encode(struct ibuf **, char **);
 int restart_state_decode(const void *, size_t, struct restart_state **,
     char **);
@@ -42,6 +44,11 @@ uint64_t restart_state_features(const struct restart_state *);
 size_t restart_state_descriptor_count(const struct restart_state *);
 int restart_state_descriptor_at(const struct restart_state *, size_t,
     u_int *, pid_t *);
+int restart_state_apply(const struct restart_state *, restart_fd_lookup_cb,
+    void *, char **);
 void restart_state_free(struct restart_state *);
+
+int restart_terminal_apply(const struct restart_terminal *,
+    struct window_pane *, char **);
 
 #endif
