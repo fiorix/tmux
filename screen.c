@@ -72,6 +72,22 @@ screen_free_titles(struct screen *s)
 	s->ntitles = 0;
 }
 
+/* Add a title to the stack, after the ones already there. */
+void
+screen_add_title(struct screen *s, const char *text)
+{
+	struct screen_title_entry	*title_entry;
+
+	if (s->titles == NULL) {
+		s->titles = xmalloc(sizeof *s->titles);
+		TAILQ_INIT(s->titles);
+	}
+	title_entry = xmalloc(sizeof *title_entry);
+	title_entry->text = xstrdup(text);
+	TAILQ_INSERT_TAIL(s->titles, title_entry, entry);
+	s->ntitles++;
+}
+
 /* Get title from the stack, oldest first. */
 const char *
 screen_title_at(const struct screen *s, u_int n)
@@ -200,6 +216,28 @@ screen_free(struct screen *s)
 	TAILQ_FOREACH(im, &s->images, entry)
 		im->list = &s->images;
 	image_free_all(s);
+#endif
+}
+
+/*
+ * Resize a screen that is not yet attached to anything. The images are
+ * detached first because screen_resize_cursor reaches image_free_all, which
+ * removes from the process global list an image that was never added to it.
+ */
+void
+screen_restart_resize(struct screen *s, u_int sx, u_int sy, int reflow)
+{
+#ifdef ENABLE_SIXEL
+	struct images	 detached;
+
+	TAILQ_INIT(&detached);
+	TAILQ_CONCAT(&detached, &s->images, entry);
+#endif
+
+	screen_resize_cursor(s, sx, sy, reflow, 0, 1);
+
+#ifdef ENABLE_SIXEL
+	image_restart_discard(&detached);
 #endif
 }
 
