@@ -215,6 +215,85 @@ paste_add(const char *prefix, char *data, size_t size)
 	paste_fire_event("paste-buffer-changed", pb->name);
 }
 
+/*
+ * Set a buffer with the name, order, creation time and automatic flag it was
+ * saved with, rather than with fresh ones. The order is what the buffer stack
+ * is sorted by and what paste_get_top reads, so it is taken from the caller
+ * and the counter is carried past it, leaving the next new buffer above
+ * everything restored instead of somewhere in the middle.
+ *
+ * Unlike paste_set, this takes ownership of data on failure as well as on
+ * success, so a caller that is part way through restoring a set of buffers
+ * has nothing left to free.
+ */
+int
+paste_restart_set(char *data, size_t size, const char *name, u_int order,
+    int automatic, time_t created, char **cause)
+{
+	struct paste_buffer	*pb, *old;
+	char			*newname;
+
+	if (cause != NULL)
+		*cause = NULL;
+
+	if (size == 0) {
+		free(data);
+		return (0);
+	}
+	if (name == NULL || *name == '\0') {
+		free(data);
+		if (cause != NULL)
+			*cause = xstrdup("empty buffer name");
+		return (-1);
+	}
+
+	newname = clean_name(name, 0);
+	if (newname == NULL) {
+		free(data);
+		if (cause != NULL)
+			xasprintf(cause, "invalid buffer name: %s", name);
+		return (-1);
+	}
+
+	pb = xmalloc(sizeof *pb);
+	pb->name = newname;
+
+	pb->data = data;
+	pb->size = size;
+
+	pb->automatic = automatic;
+	pb->order = order;
+	pb->created = created;
+
+	/*
+	 * The stack is keyed by order alone, so an order already in use would
+	 * insert nothing and leave a buffer that is reachable by name but
+	 * absent from the stack. Check before anything else is touched,
+	 * because past this point the buffer of the same name is gone.
+	 */
+	if (RB_FIND(paste_time_tree, &paste_by_time, pb) != NULL) {
+		free(pb->name);
+		free(pb);
+		free(data);
+		if (cause != NULL)
+			xasprintf(cause, "buffer order %u is in use", order);
+		return (-1);
+	}
+
+	if (automatic)
+		paste_num_automatic++;
+	if (order >= paste_next_order)
+		paste_next_order = order + 1;
+
+	if ((old = paste_get_name(pb->name)) != NULL)
+		paste_free(old);
+
+	RB_INSERT(paste_name_tree, &paste_by_name, pb);
+	RB_INSERT(paste_time_tree, &paste_by_time, pb);
+
+	return (0);
+}
+
 /* Rename a paste buffer. */
 int
 paste_rename(const char *oldname, const char *newname, char **cause)

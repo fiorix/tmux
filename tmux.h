@@ -2676,6 +2676,8 @@ void		 paste_free(struct paste_buffer *);
 void		 paste_add(const char *, char *, size_t);
 int		 paste_rename(const char *, const char *, char **);
 int		 paste_set(char *, size_t, const char *, char **);
+int		 paste_restart_set(char *, size_t, const char *, u_int, int,
+		     time_t, char **);
 void		 paste_replace(struct paste_buffer *, char *, size_t);
 char		*paste_make_sample(struct paste_buffer *);
 
@@ -3473,6 +3475,12 @@ size_t	 input_get_buffer_size(void);
 void	 input_save_parser(const struct input_ctx *,
 	     struct input_parser_state *);
 void	 input_free_parser_state(struct input_parser_state *);
+int	 input_restore(const struct input_parser_state *,
+	     struct input_ctx **, char **);
+int	 input_restart_arm_ground_timer(struct input_ctx *, char **);
+void	 input_restart_bind(struct input_ctx *, struct window_pane *,
+	     struct bufferevent *, struct colour_palette *);
+void	 input_restart_discard(struct input_ctx *);
 void	 input_request_reply(struct client *, enum input_request_type, void *);
 void	 input_cancel_requests(struct client *);
 
@@ -3522,6 +3530,9 @@ int	 grid_cells_equal(const struct grid_cell *, const struct grid_cell *);
 int	 grid_cells_look_equal(const struct grid_cell *,
 	     const struct grid_cell *);
 struct grid *grid_create(u_int, u_int, u_int);
+struct grid *grid_restart_create(u_int, u_int, u_int, u_int);
+void	 grid_restart_set_cell(struct grid *, u_int, u_int,
+	     const struct grid_cell *);
 void	 grid_destroy(struct grid *);
 void	 grid_free_lines(struct grid *, u_int, u_int);
 int	 grid_compare(struct grid *, struct grid *);
@@ -3704,7 +3715,9 @@ int	 screen_set_title(struct screen *, const char *, int);
 int	 screen_set_path(struct screen *, const char *, int);
 void	 screen_push_title(struct screen *);
 void	 screen_pop_title(struct screen *);
+void	 screen_add_title(struct screen *, const char *);
 const char *screen_title_at(const struct screen *, u_int);
+void	 screen_restart_resize(struct screen *, u_int, u_int, int);
 void	 screen_set_progress_bar(struct screen *, enum progress_bar_state, int);
 void	 screen_resize(struct screen *, u_int, u_int, int);
 void	 screen_resize_cursor(struct screen *, u_int, u_int, int, int, int);
@@ -3749,6 +3762,25 @@ struct window	*window_find_by_id(u_int);
 void		 window_update_activity(struct window *);
 struct window	*window_create(u_int, u_int, u_int, u_int);
 void		 window_get_counters(u_int *, u_int *, u_int *);
+void		 window_set_counters(u_int, u_int, u_int);
+int		 window_restart_create(struct windows *, uint32_t,
+		     const char *, u_int, u_int, u_int, u_int,
+		     struct options *, struct window **, char **);
+int		 window_pane_restart_create(struct window_pane_tree *,
+		     struct window *, uint32_t, uint32_t, u_int, u_int,
+		     struct options *, struct window_pane **, char **);
+int		 window_pane_restart_set_event(struct window_pane *, int,
+		     char **);
+int		 window_pane_restart_stage_resize(struct window_pane *,
+		     u_int, u_int, char **);
+int		 window_pane_restart_enable_event(struct window_pane *,
+		     char **);
+void		 window_pane_restart_release(struct window_pane_tree *,
+		     struct window_pane *);
+void		 window_pane_restart_remove(struct window_pane_tree *,
+		     struct window_pane *);
+void		 window_restart_destroy(struct windows *,
+		     struct window_pane_tree *, struct window *);
 void		 window_pane_set_event(struct window_pane *);
 void		 window_pane_wait_finish(struct window_pane *);
 struct window_pane *window_get_active_at(struct window *, u_int, u_int);
@@ -3902,6 +3934,10 @@ int		 layout_add_horizontal_border(struct layout_cell *,
 		     struct layout_cell *, int);
 void		 layout_fix_offsets(struct window *);
 void		 layout_fix_panes(struct window *, struct window_pane *);
+void		 layout_restart_free_cell(struct layout_cell *);
+void		 layout_restart_fix_panes(struct window *);
+void		 layout_restart_remove_pane(struct window *,
+		     struct window_pane *);
 void		 layout_resize_adjust(struct window *, struct layout_cell *,
 		     enum layout_type, int);
 void		 layout_resize_set_size(struct window *, struct layout_cell *,
@@ -4135,6 +4171,19 @@ struct session_group *session_group_new(const char *);
 void		 session_group_add(struct session_group *, struct session *);
 void		 session_group_synchronize_to(struct session *);
 void		 session_group_synchronize_from(struct session *);
+int		 session_restart_create(struct sessions *, uint32_t,
+		     const char *, const char *, struct environ *,
+		     struct options *, const struct termios *,
+		     struct session **, char **);
+int		 session_group_restart_create(struct session_groups *,
+		     const char *, struct session_group **, char **);
+void		 session_group_restart_add(struct session_group *,
+		     struct session *);
+int		 winlink_restart_create(struct session *, struct window *,
+		     int, int, struct winlink **, char **);
+struct window	*session_restart_unlink(struct session *, struct winlink *);
+void		 session_restart_destroy(struct sessions *,
+		     struct session_groups *, struct session *);
 u_int		 session_group_count(struct session_group *);
 u_int		 session_group_attached_count(struct session_group *);
 void		 session_renumber_windows(struct session *);
@@ -4146,6 +4195,10 @@ enum utf8_state	 utf8_towc (const struct utf8_data *, wchar_t *);
 enum utf8_state	 utf8_fromwc(wchar_t wc, struct utf8_data *);
 int		 utf8_has_whitespace(const struct utf8_data *);
 void		 utf8_update_width_cache(void);
+struct utf8_restart_cache;
+struct utf8_restart_cache *utf8_restart_prepare_width_cache(struct options *);
+void	 utf8_restart_commit_width_cache(struct utf8_restart_cache *);
+void	 utf8_restart_discard_width_cache(struct utf8_restart_cache *);
 utf8_char	 utf8_build_one(u_char);
 enum utf8_state	 utf8_from_data(const struct utf8_data *, utf8_char *);
 void		 utf8_to_data(utf8_char, struct utf8_data *);
@@ -4236,6 +4289,8 @@ void		 style_set(struct style *, const struct grid_cell *);
 void		 style_copy(struct style *, struct style *);
 void		 style_set_scrollbar_style_from_option(struct style *,
 		     struct options *);
+int		 style_restart_scrollbar(struct style *, struct options *,
+		     struct window_pane *, char **);
 void		 style_ranges_init(struct style_ranges *);
 void		 style_ranges_free(struct style_ranges *);
 struct style_range *style_ranges_get_range(struct style_ranges *, u_int);
@@ -4258,6 +4313,9 @@ char		*regsub(const char *, const char *, const char *, int);
 int		 image_free_all(struct screen *);
 struct image	*image_store(struct screen *, struct sixel_image *);
 u_int		 image_limit(void);
+int		 image_restart_room(size_t);
+void		 image_restart_discard(struct images *);
+void		 image_restart_commit(struct screen *, struct images *, int);
 int		 image_check_line(struct screen *, u_int, u_int);
 int		 image_check_area(struct screen *, u_int, u_int, u_int, u_int);
 int		 image_scroll_up(struct screen *, u_int);
@@ -4303,6 +4361,13 @@ u_int			 hyperlinks_entry(struct hyperlinks_uri *,
 			     const char **, const char **, const char **);
 u_int			 hyperlinks_next_inner(struct hyperlinks *);
 u_int			 hyperlinks_limit(void);
+struct hyperlinks	*hyperlinks_restart_init(u_int);
+int			 hyperlinks_restart_add(struct hyperlinks *, u_int,
+			     const char *, const char *, const char *);
+int			 hyperlinks_restart_preflight(size_t, char **);
+void			 hyperlinks_restart_commit(struct hyperlinks *);
+void			 hyperlinks_restart_discard(struct hyperlinks *);
+void			 hyperlinks_restart_set_next_external_id(long long);
 long long		 hyperlinks_get_next_external_id(void);
 struct hyperlinks	*hyperlinks_init(void);
 struct hyperlinks	*hyperlinks_copy(struct hyperlinks *);

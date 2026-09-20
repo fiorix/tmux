@@ -2941,3 +2941,412 @@ window_pane_is_floating_with_hidden(struct window_pane *wp)
 		return (0);
 	return (1);
 }
+
+void
+window_set_counters(u_int window_id, u_int pane_id, u_int active_point)
+{
+	next_window_id = window_id;
+	next_window_pane_id = pane_id;
+	next_active_point = active_point;
+}
+
+int
+window_restart_create(struct windows *root, uint32_t id, const char *name,
+    u_int sx, u_int sy, u_int xpixel, u_int ypixel, struct options *oo,
+    struct window **out, char **cause)
+{
+	struct window	*w;
+
+	*out = NULL;
+	w = xcalloc(1, sizeof *w);
+	if (w == NULL)
+		return (-1);
+	w->name = xstrdup(name);
+	if (w->name == NULL) {
+		free(w);
+		return (-1);
+	}
+
+	w->flags = 0;
+	TAILQ_INIT(&w->panes);
+	TAILQ_INIT(&w->z_index);
+	TAILQ_INIT(&w->last_panes);
+	TAILQ_INIT(&w->winlinks);
+	w->active = NULL;
+	w->modal = NULL;
+	w->modal_last = NULL;
+	w->lastlayout = -1;
+	w->layout_root = NULL;
+	w->saved_layout_root = NULL;
+	w->old_layout = NULL;
+	w->sx = sx;
+	w->sy = sy;
+	w->manual_sx = sx;
+	w->manual_sy = sy;
+	w->xpixel = xpixel;
+	w->ypixel = ypixel;
+	w->options = oo;
+	w->references = 0;
+	w->id = id;
+
+	if (RB_INSERT(windows, root, w) != NULL) {
+		xasprintf(cause, "duplicate restart window");
+		free(w->name);
+		free(w);
+		return (-1);
+	}
+
+	*out = w;
+	return (0);
+}
+
+int
+window_pane_restart_create(struct window_pane_tree *root, struct window *w,
+    uint32_t id, uint32_t active_point, u_int sx, u_int sy,
+    struct options *oo, struct window_pane **out, char **cause)
+{
+	struct window_pane	*wp;
+
+	*out = NULL;
+	wp = xcalloc(1, sizeof *wp);
+	if (wp == NULL)
+		return (-1);
+	wp->references = 1;
+	wp->window = w;
+	wp->options = oo;
+	wp->flags = 0;
+	wp->cmd_status = -1;
+	wp->id = id;
+	wp->active_point = active_point;
+	wp->fd = -1;
+	wp->pipe_fd = -1;
+	wp->control_bg = -1;
+	wp->control_fg = -1;
+	wp->sx = sx;
+	wp->sy = sy;
+	TAILQ_INIT(&wp->modes);
+	TAILQ_INIT(&wp->resize_queue);
+	colour_palette_init(&wp->palette);
+	style_ranges_init(&wp->border_status_line.ranges);
+	evtimer_set(&wp->sb_auto_timer, window_pane_scrollbar_timer, wp);
+
+	screen_init(&wp->base, sx, sy, 0);
+	wp->screen = &wp->base;
+	screen_init(&wp->status_screen, 1, 1, 0);
+
+	if (RB_INSERT(window_pane_tree, root, wp) != NULL) {
+		xasprintf(cause, "duplicate restart pane");
+		screen_free(&wp->status_screen);
+		screen_free(&wp->base);
+		free(wp);
+		return (-1);
+	}
+
+	*out = wp;
+	return (0);
+}
+
+int
+window_pane_restart_set_event(struct window_pane *wp, int fd, char **cause)
+{
+	struct bufferevent	*event;
+
+	event = bufferevent_new(fd, window_pane_read_callback, NULL,
+	    window_pane_error_callback, wp);
+	if (event == NULL) {
+		xasprintf(cause, "out of memory");
+		return (-1);
+	}
+	bufferevent_disable(event, EV_READ|EV_WRITE);
+	wp->event = event;
+	return (0);
+}
+
+/*
+ * Stage the one startup resize a restored pane owes its child.
+ *
+ * The record is the ordinary shape and joins the ordinary queue, but nothing
+ * is delivered here: no event is fired and no ioctl is issued, because the
+ * candidate is not published yet and its fd is not the child's until it is.
+ * Delivery is window_pane_restart_enable_event's job.
+ */
+int
+window_pane_restart_stage_resize(struct window_pane *wp, u_int sx, u_int sy,
+    __unused char **cause)
+{
+	struct window_pane_resize	*r;
+
+	if (sx == wp->sx && sy == wp->sy)
+		return (0);
+
+	r = xcalloc(1, sizeof *r);
+	if (r == NULL)
+		return (-1);
+	r->osx = wp->sx;
+	r->osy = wp->sy;
+	r->sx = sx;
+	r->sy = sy;
+	TAILQ_INSERT_TAIL(&wp->resize_queue, r, entry);
+
+	wp->sx = sx;
+	wp->sy = sy;
+	return (0);
+}
+
+/*
+ * The resize is sent synchronously rather than left for server_client_loop,
+ * because a child that reads before the deferred timer fires would see the
+ * old geometry and draw against it.
+ *
+ * The ordinary sender calls fatal when the ioctl fails, which is not
+ * available here: this runs after publication, where the policy is to report
+ * one cause and let the caller decide. So the winsize construction is
+ * repeated in a checked form rather than reused.
+ */
+int
+window_pane_restart_enable_event(struct window_pane *wp, char **cause)
+{
+	struct window_pane_resize	*r;
+	struct winsize			 ws;
+
+	r = TAILQ_FIRST(&wp->resize_queue);
+	if (r != NULL) {
+		if (TAILQ_NEXT(r, entry) != NULL) {
+			xasprintf(cause,
+			    "restart pane has more than one staged resize");
+			return (-1);
+		}
+		if (wp->fd != -1) {
+			memset(&ws, 0, sizeof ws);
+			ws.ws_col = r->sx;
+			ws.ws_row = r->sy;
+			ws.ws_xpixel = wp->window->xpixel * ws.ws_col;
+			ws.ws_ypixel = wp->window->ypixel * ws.ws_row;
+			if (ioctl(wp->fd, TIOCSWINSZ, &ws) == -1) {
+				xasprintf(cause,
+				    "restart pane resize delivery failed");
+				return (-1);
+			}
+		}
+		TAILQ_REMOVE(&wp->resize_queue, r, entry);
+		free(r);
+	}
+
+	if (wp->event != NULL)
+		bufferevent_enable(wp->event, EV_READ|EV_WRITE);
+	return (0);
+}
+
+/*
+ * Severs the layout back-pointers before the pane is freed, so a later
+ * layout_free_cell cannot read or write through the freed pane if the
+ * candidate layout was not repaired first.
+ */
+static void
+window_pane_restart_teardown(struct window_pane *wp)
+{
+	struct window_pane_resize	*r;
+	int				 i;
+
+	if (wp->layout_cell != NULL) {
+		wp->layout_cell->wp = NULL;
+		wp->layout_cell = NULL;
+	}
+	if (wp->saved_layout_cell != NULL) {
+		wp->saved_layout_cell->wp = NULL;
+		wp->saved_layout_cell = NULL;
+	}
+
+	if (wp->event != NULL) {
+		bufferevent_free(wp->event);
+		wp->event = NULL;
+	}
+	while (!TAILQ_EMPTY(&wp->resize_queue)) {
+		r = TAILQ_FIRST(&wp->resize_queue);
+		TAILQ_REMOVE(&wp->resize_queue, r, entry);
+		free(r);
+	}
+	/* bufferevent_new does not own the descriptor, so close it here. */
+	if (wp->fd != -1) {
+		close(wp->fd);
+		wp->fd = -1;
+	}
+	if (wp->ictx != NULL) {
+		input_free(wp->ictx);
+		wp->ictx = NULL;
+	}
+	if (event_initialized(&wp->resize_timer))
+		event_del(&wp->resize_timer);
+	if (event_initialized(&wp->sb_auto_timer))
+		event_del(&wp->sb_auto_timer);
+	window_pane_clear_resizes(wp, NULL);
+	screen_free(&wp->status_screen);
+	screen_free(&wp->base);
+	free(wp->palette.palette);
+	free(wp->palette.default_palette);
+	colour_palette_init(&wp->palette);
+	options_free(wp->options);
+	free(wp->searchstr);
+	free(wp->cwd);
+	free(wp->shell);
+	if (wp->argv != NULL) {
+		for (i = 0; i < wp->argc; i++)
+			free(wp->argv[i]);
+		free(wp->argv);
+	}
+	free(wp);
+}
+
+/*
+ * Removes a candidate pane from whichever of its window's lists actually hold
+ * it. Membership is tested rather than inferred from position in the
+ * construction sequence, because rollback can run at any point and a pane
+ * created but not yet linked is on none of them. Testing by walking is exact
+ * regardless of which queue.h is in use, where a cleared or poisoned link
+ * field is not.
+ */
+static int
+window_pane_restart_in_z(struct window *w, struct window_pane *wp)
+{
+	struct window_pane	*loop;
+
+	TAILQ_FOREACH(loop, &w->z_index, zentry) {
+		if (loop == wp)
+			return (1);
+	}
+	return (0);
+}
+
+static void
+window_pane_restart_detach(struct window_pane_tree *root,
+    struct window_pane *wp)
+{
+	struct window	*w = wp->window;
+
+	if (w != NULL) {
+		if (window_has_pane(w, wp))
+			TAILQ_REMOVE(&w->panes, wp, entry);
+		if (window_pane_restart_in_z(w, wp))
+			TAILQ_REMOVE(&w->z_index, wp, zentry);
+		window_pane_stack_remove(&w->last_panes, wp);
+		if (w->active == wp)
+			w->active = NULL;
+		if (w->modal == wp)
+			w->modal = NULL;
+		if (w->modal_last == wp)
+			w->modal_last = NULL;
+		if (w->was_zoomed == wp)
+			w->was_zoomed = NULL;
+	}
+	RB_REMOVE(window_pane_tree, root, wp);
+}
+
+/*
+ * Detach and destroy one candidate pane without selection repair, for the
+ * rollback and whole-window paths where the window is going away too.
+ */
+void
+window_pane_restart_release(struct window_pane_tree *root,
+    struct window_pane *wp)
+{
+	window_pane_restart_detach(root, wp);
+	window_pane_restart_teardown(wp);
+}
+
+void
+window_pane_restart_remove(struct window_pane_tree *root,
+    struct window_pane *wp)
+{
+	struct window		*w = wp->window;
+	struct window_pane	*next, *previous, *modal_last = NULL;
+	int			 active;
+
+	if (w != NULL) {
+		active = (w->active == wp);
+		if (w->modal == wp) {
+			modal_last = w->modal_last;
+			w->modal = NULL;
+			w->modal_last = NULL;
+		}
+		if (w->modal_last == wp)
+			w->modal_last = NULL;
+		if (w->was_zoomed == wp)
+			w->was_zoomed = NULL;
+		if (modal_last == wp)
+			modal_last = NULL;
+
+		previous = TAILQ_PREV(wp, window_panes, entry);
+		if (window_has_pane(w, wp))
+			TAILQ_REMOVE(&w->panes, wp, entry);
+		if (window_pane_restart_in_z(w, wp))
+			TAILQ_REMOVE(&w->z_index, wp, zentry);
+		window_pane_stack_remove(&w->last_panes, wp);
+
+		if (active) {
+			next = modal_last;
+			if (next == NULL)
+				next = TAILQ_FIRST(&w->last_panes);
+			if (next == NULL)
+				next = previous;
+			if (next == NULL)
+				next = TAILQ_LAST(&w->panes, window_panes);
+			w->active = next;
+			if (next != NULL) {
+				window_pane_stack_remove(&w->last_panes, next);
+				next->flags |= PANE_CHANGED;
+			}
+		}
+	}
+	RB_REMOVE(window_pane_tree, root, wp);
+	window_pane_restart_teardown(wp);
+}
+
+void
+window_restart_destroy(struct windows *root, struct window_pane_tree *panes,
+    struct window *w)
+{
+	struct window_pane	*wp;
+
+	layout_restart_free_cell(w->layout_root);
+	layout_restart_free_cell(w->saved_layout_root);
+	w->layout_root = NULL;
+	w->saved_layout_root = NULL;
+
+	while (!TAILQ_EMPTY(&w->panes)) {
+		wp = TAILQ_FIRST(&w->panes);
+		window_pane_restart_release(panes, wp);
+	}
+	while (!TAILQ_EMPTY(&w->last_panes)) {
+		wp = TAILQ_FIRST(&w->last_panes);
+		window_pane_stack_remove(&w->last_panes, wp);
+	}
+	w->active = NULL;
+	w->modal = NULL;
+	w->modal_last = NULL;
+	w->was_zoomed = NULL;
+
+	if (event_initialized(&w->name_event))
+		evtimer_del(&w->name_event);
+	if (event_initialized(&w->alerts_timer))
+		evtimer_del(&w->alerts_timer);
+	if (event_initialized(&w->offset_timer))
+		event_del(&w->offset_timer);
+
+	/*
+	 * Any pane still on the candidate root that names this window would
+	 * otherwise hold a dangling owner pointer, and its later release would
+	 * read the freed window to test list membership. Clearing the back
+	 * pointer makes the release order irrelevant rather than making the
+	 * caller responsible for it.
+	 */
+	RB_FOREACH(wp, window_pane_tree, panes) {
+		if (wp->window == w)
+			wp->window = NULL;
+	}
+
+	RB_REMOVE(windows, root, w);
+	options_free(w->options);
+	free(w->old_layout);
+	free(w->name);
+	free(w);
+}

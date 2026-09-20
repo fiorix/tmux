@@ -577,3 +577,61 @@ style_ranges_get_range(struct style_ranges *srs, u_int x)
 	}
 	return (NULL);
 }
+
+/*
+ * Candidate form of the scrollbar style derivation.
+ *
+ * Two differences from the live form, both required rather than stylistic.
+ * The format tree sets FORMAT_NOJOBS, because format_single does not and a
+ * "#()" in the option would spawn a job while a candidate graph is half
+ * built. And a malformed default reports a cause instead of calling fatalx,
+ * since apply must be able to unwind rather than take the server down.
+ */
+int
+style_restart_scrollbar(struct style *sb_style, struct options *oo,
+    struct window_pane *wp, char **cause)
+{
+	const struct options_table_entry	*oe;
+	struct options_entry			*o;
+	struct format_tree			*ft;
+	const char				*s;
+	char					*style, *expanded;
+
+	style_set(sb_style, &grid_default_cell);
+	o = options_get(oo, "pane-scrollbars-style");
+	if (o == NULL) {
+		xasprintf(cause,
+		    "restart pane has no scrollbar style option");
+		return (-1);
+	}
+	oe = options_table_entry(o);
+
+	ft = format_create(NULL, NULL, FORMAT_NONE, FORMAT_NOJOBS);
+	format_defaults(ft, NULL, NULL, NULL, wp);
+
+	style = format_expand(ft, oe->default_str);
+	if (style_parse(sb_style, &grid_default_cell, style) != 0) {
+		free(style);
+		format_free(ft);
+		xasprintf(cause,
+		    "restart scrollbar style default does not parse");
+		return (-1);
+	}
+
+	s = options_get_string(oo, "pane-scrollbars-style");
+	if (s != NULL) {
+		expanded = format_expand(ft, s);
+		if (style_parse(sb_style, &grid_default_cell, expanded) != 0)
+			style_parse(sb_style, &grid_default_cell, style);
+		free(expanded);
+	}
+	free(style);
+	format_free(ft);
+
+	if (sb_style->width < 1)
+		sb_style->width = PANE_SCROLLBARS_DEFAULT_WIDTH;
+	if (sb_style->pad < 0)
+		sb_style->pad = PANE_SCROLLBARS_DEFAULT_PADDING;
+	utf8_set(&sb_style->gc.data, PANE_SCROLLBARS_CHARACTER);
+	return (0);
+}

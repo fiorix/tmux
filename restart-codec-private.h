@@ -300,9 +300,26 @@ int restart_terminal_read_nested(struct restart_reader *,
 int restart_terminal_validate_nested(const struct restart_terminal *, size_t,
     char **);
 
+struct restart_terminal_prepared;
+
+int restart_terminal_prepare(const struct restart_terminal *,
+    struct window_pane *, struct restart_budget *,
+    struct restart_terminal_prepared **, char **);
+int restart_terminal_preflight_batch(struct restart_terminal_prepared **,
+    size_t, char **);
+void restart_terminal_preflight_rearm(void);
+int restart_terminal_resize_prepared(struct restart_terminal_prepared *,
+    u_int, u_int, char **);
+void restart_terminal_commit(struct restart_terminal_prepared *,
+    struct window_pane *);
+void restart_terminal_discard(struct restart_terminal_prepared *);
+
 int restart_cell_capture(const struct grid_cell *, struct restart_cell *,
     char **);
 int restart_cell_build(const struct restart_cell *, struct grid_cell *,
     char **);
+int restart_parser_timer_state(const char *);
+int restart_parser_build(const struct restart_parser *,
+    struct input_parser_state *, char **);
 
 #endif

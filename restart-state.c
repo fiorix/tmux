@@ -30,6 +30,8 @@
 #include "restart-state-private.h"
 
 static u_int	restart_flags_mask(const struct restart_flag_map *, u_int);
+static int	restart_flags_from_wire(const struct restart_flag_map *,
+		    u_int, u_int);
 static int	restart_flags_to_wire(const struct restart_flag_map *, u_int,
 		    int, size_t, u_int *, char **);
 
@@ -2518,6 +2520,32 @@ restart_buffers_capture(struct restart_state *state,
 		out->automatic = (paste_buffer_automatic(pb) != 0);
 	}
 	return (0);
+}
+
+/*
+ * Install the saved paste buffers. Each carries the order it was saved with,
+ * so the stack is rebuilt by those values rather than by the sequence of
+ * these calls, and a reordering of the records cannot change what
+ * paste_get_top returns.
+ */
+static void
+restart_buffers_publish(const struct restart_state *state)
+{
+	const struct restart_buffer	*buffer;
+	char				*data, *cause;
+	size_t				 i;
+
+	for (i = 0; i < state->buffer_count; i++) {
+		buffer = &state->buffers[i];
+		data = xmalloc(buffer->data.size);
+		memcpy(data, buffer->data.data, buffer->data.size);
+		if (paste_restart_set(data, buffer->data.size, buffer->name,
+		    buffer->order, buffer->automatic, buffer->created,
+		    &cause) != 0) {
+			log_debug("%s: %s", __func__, cause);
+			free(cause);
+		}
+	}
 }
 
 /* Write the paste buffers. */
@@ -5445,6 +5473,21 @@ restart_state_validate_features(const struct restart_state *state, char **cause)
  * it is a second statement of the same relationship, and the moment a row is
  * added the two disagree with nothing to notice it.
  */
+/* Convert wire flags to live flags. */
+static int
+restart_flags_from_wire(const struct restart_flag_map *map, u_int count,
+    u_int wire)
+{
+	u_int	i;
+	int	live = 0;
+
+	for (i = 0; i < count; i++) {
+		if (wire & map[i].wire)
+			live |= map[i].live;
+	}
+	return (live);
+}
+
 static u_int
 restart_flags_mask(const struct restart_flag_map *map, u_int count)
 {
@@ -6476,4 +6519,2517 @@ restart_state_descriptor_at(const struct restart_state *state, size_t index,
 	*pane_id = key->pane_id;
 	*pid = (pid_t)key->pid;
 	return (0);
+}
+/*
+ * One entry of the lifecycle-7 cascade queue.
+ *
+ * The queue is sized before finalization and an object is marked removed when
+ * its work is accepted, so a pointer reached twice is queued once. That is
+ * what keeps every reverse link, reference, event, duplicate and object
+ * released exactly once, and it is why the cascade never recurses through
+ * deferred destruction.
+ */
+enum restart_work_kind {
+	RESTART_WORK_PANE,
+	RESTART_WORK_WINDOW,
+	RESTART_WORK_SESSION,
+	RESTART_WORK_GROUP
+};
+
+struct restart_work {
+	enum restart_work_kind	 kind;
+	size_t			 index;
+};
+
+
+/* Build one option value into a set. */
+static int
+restart_option_build(struct options *oo, const struct restart_option *entry,
+    const char *key, const char *string, int64_t number, char **cause)
+{
+	struct options_entry			*o;
+	const struct options_table_entry	*oe;
+	char					*value = NULL;
+	int					 error;
+
+	if (entry->type == RESTART_OPTION_USER) {
+		options_set_string(oo, entry->name, 0, "%s", string);
+		return (0);
+	}
+	oe = options_search(entry->name);
+	if (oe == NULL)
+		return (0);
+
+	if (!entry->is_array) {
+		/*
+		 * Some of these sets have no parent, and without one the
+		 * setters fatal rather than create an option that is missing.
+		 */
+		if (options_get_only(oo, entry->name) == NULL)
+			options_default(oo, oe);
+		switch (entry->type) {
+		case RESTART_OPTION_STRING:
+			options_set_string(oo, entry->name, 0, "%s", string);
+			return (0);
+		case RESTART_OPTION_COMMAND:
+			return (options_from_string(oo, oe, entry->name,
+			    string, 0, cause));
+		default:
+			options_set_number(oo, entry->name, number);
+			return (0);
+		}
+	}
+
+	o = options_get_only(oo, entry->name);
+	if (o == NULL)
+		o = options_empty(oo, oe);
+	switch (entry->type) {
+	case RESTART_OPTION_STRING:
+	case RESTART_OPTION_COMMAND:
+		return (options_array_set(o, key, string, 0, cause));
+	case RESTART_OPTION_COLOUR:
+		xasprintf(&value, "%s", colour_tostring(number));
+		error = options_array_set(o, key, value, 0, cause);
+		free(value);
+		return (error);
+	}
+	restart_set_cause(cause, "restart option %s cannot be an array",
+	    entry->name);
+	return (-1);
+}
+
+
+
+struct restart_layout_build_frame {
+	const struct restart_layout_cell	*in;
+	struct layout_cell			*lc;
+	size_t					 next;
+};
+
+/* Find a pane of this window by id. */
+static struct window_pane *
+restart_layout_find_pane(struct window *w, uint32_t id)
+{
+	struct window_pane	*wp;
+
+	TAILQ_FOREACH(wp, &w->panes, entry) {
+		if (wp->id == id)
+			return (wp);
+	}
+	return (NULL);
+}
+
+/* Build a live layout tree from a decoded one. */
+static int
+restart_layout_build(const struct restart_layout *in, struct window *w,
+    int saved, struct restart_budget *budget, struct layout_cell **out,
+    char **cause)
+{
+	struct restart_layout_build_frame	*stack = NULL;
+	struct layout_cell			*root = NULL, *lc, *child;
+	const struct restart_layout_cell	*cell;
+	struct window_pane			*wp;
+	size_t					 depth = 0, i;
+	int					 retval = -1;
+
+	*out = NULL;
+	if (in == NULL || in->root == NULL) {
+		restart_set_cause(cause, "restart layout has no root");
+		return (-1);
+	}
+
+	stack = restart_calloc(budget, in->cell_count, sizeof *stack, cause);
+	if (stack == NULL)
+		return (-1);
+
+	root = layout_create_cell(NULL);
+	stack[depth].in = in->root;
+	stack[depth].lc = root;
+	stack[depth].next = 0;
+	depth++;
+
+	while (depth != 0) {
+		cell = stack[depth - 1].in;
+		lc = stack[depth - 1].lc;
+
+		if (stack[depth - 1].next == 0) {
+			if (cell->type == RESTART_LAYOUT_HORIZONTAL)
+				layout_make_node(lc, LAYOUT_LEFTRIGHT);
+			else if (cell->type == RESTART_LAYOUT_VERTICAL)
+				layout_make_node(lc, LAYOUT_TOPBOTTOM);
+			layout_set_size(lc, cell->sx, cell->sy, cell->xoff,
+			    cell->yoff);
+			if (cell->have_fg) {
+				lc->fg.sx = cell->fg_sx;
+				lc->fg.sy = cell->fg_sy;
+				lc->fg.xoff = cell->fg_xoff;
+				lc->fg.yoff = cell->fg_yoff;
+			}
+
+			if (cell->type == RESTART_LAYOUT_PANE) {
+				wp = restart_layout_find_pane(w, cell->pane_id);
+				if (wp == NULL) {
+					restart_set_cause(cause, "restart "
+					    "layout names a foreign pane");
+					goto out;
+				}
+				lc->wp = wp;
+				if (cell->floating)
+					lc->flags |= LAYOUT_CELL_FLOATING;
+				if (saved)
+					wp->saved_layout_cell = lc;
+				else
+					wp->layout_cell = lc;
+			}
+		}
+
+		if (stack[depth - 1].next == cell->child_count) {
+			depth--;
+			continue;
+		}
+		i = stack[depth - 1].next++;
+		if (depth == in->cell_count) {
+			restart_set_cause(cause, "restart layout is too deep");
+			goto out;
+		}
+		child = layout_create_cell(lc);
+		TAILQ_INSERT_TAIL(&lc->cells, child, entry);
+		stack[depth].in = cell->children[i];
+		stack[depth].lc = child;
+		stack[depth].next = 0;
+		depth++;
+	}
+
+	*out = root;
+	root = NULL;
+	retval = 0;
+
+out:
+	if (root != NULL)
+		layout_restart_free_cell(root);
+	free(stack);
+	return (retval);
+}
+
+/* Build an environment from a captured one. */
+static struct environ *
+restart_environment_build(const struct restart_environment *in)
+{
+	const struct restart_environment_entry	*entry;
+	struct environ				*env;
+	size_t					 i;
+	int					 flags;
+
+	env = environ_create();
+	for (i = 0; i < in->count; i++) {
+		entry = &in->entries[i];
+		flags = 0;
+		if (entry->flags & RESTART_ENVIRON_HIDDEN)
+			flags |= ENVIRON_HIDDEN;
+		if (entry->state == RESTART_ENV_STATE_SET)
+			environ_set(env, entry->name, flags, "%s",
+			    entry->value);
+		else
+			environ_clear(env, entry->name);
+	}
+	return (env);
+}
+
+/*
+ * Build a set of options. An option the table has and the checkpoint does not
+ * takes its default, which is what lets an older checkpoint be read.
+ */
+static int
+restart_options_build(const struct restart_options *in, struct options *parent,
+    struct options **out, char **cause)
+{
+	const struct options_table_entry	*oe;
+	const struct restart_option		*entry;
+	struct options				*oo;
+	size_t					 i, j;
+
+	*out = NULL;
+	oo = options_create(parent);
+
+	for (i = 0; i < in->count; i++) {
+		entry = &in->entries[i];
+		if (!entry->is_array) {
+			if (restart_option_build(oo, entry, NULL,
+			    entry->string, entry->number, cause) != 0)
+				goto fail;
+			continue;
+		}
+		for (j = 0; j < entry->item_count; j++) {
+			if (restart_option_build(oo, entry,
+			    entry->items[j].key, entry->items[j].string,
+			    entry->items[j].number, cause) != 0)
+				goto fail;
+		}
+	}
+
+	if (in->scope != 0) {
+		for (oe = options_table; oe->name != NULL; oe++) {
+			if ((oe->scope & in->scope) == 0)
+				continue;
+			if (options_get_only(oo, oe->name) == NULL)
+				options_default(oo, oe);
+		}
+	}
+
+	*out = oo;
+	return (0);
+
+fail:
+	options_free(oo);
+	return (-1);
+}
+
+struct restart_apply_context {
+	struct restart_budget		 budget;
+
+	struct sessions			 sessions;
+	struct session_groups		 groups;
+	struct windows			 windows;
+	struct window_pane_tree		 panes;
+
+	struct options			*global_options;
+	struct options			*global_s_options;
+	struct options			*global_w_options;
+	struct environ			*global_environ;
+	struct utf8_restart_cache	*utf8_cache;
+
+	struct session			**sessions_by_id;
+	struct session_group		**groups_by_record;
+	struct window			**windows_by_id;
+	struct window_pane		**panes_by_id;
+	struct restart_terminal_prepared **terminals;
+	struct restart_terminal_prepared **survivors;
+	int				*borrowed_fds;
+	int				*duplicate_fds;
+
+	uint8_t				*removed_sessions;
+	uint8_t				*removed_groups;
+	uint8_t				*removed_windows;
+	uint8_t				*removed_panes;
+
+	struct restart_work		*work;
+	size_t				 work_count;
+	size_t				 work_head;
+	size_t				 work_capacity;
+
+	size_t				 pane_count;
+	size_t				 descriptor_count;
+	size_t				 input_buffer_size;
+
+	struct timeval			 start_time;
+	uint32_t			 next_session_id;
+	uint32_t			 next_window_id;
+	uint32_t			 next_pane_id;
+	uint32_t			 next_active_point;
+	long long			 next_hyperlink_external_id;
+
+	int				 published;
+};
+
+static int
+restart_apply_roots_empty(char **cause)
+{
+	if (!RB_EMPTY(&sessions) || !RB_EMPTY(&session_groups) ||
+	    !RB_EMPTY(&windows) || !RB_EMPTY(&all_window_panes)) {
+		restart_set_cause(cause, "restart apply needs an empty server");
+		return (-1);
+	}
+	if (!TAILQ_EMPTY(&clients)) {
+		restart_set_cause(cause, "restart apply needs no clients");
+		return (-1);
+	}
+	return (0);
+}
+
+static void
+restart_apply_init(struct restart_apply_context *ctx)
+{
+	restart_terminal_preflight_rearm();
+	memset(ctx, 0, sizeof *ctx);
+	RB_INIT(&ctx->sessions);
+	RB_INIT(&ctx->groups);
+	RB_INIT(&ctx->windows);
+	RB_INIT(&ctx->panes);
+}
+
+/*
+ * Releases every candidate allocation and leaves the live roots, globals and
+ * counters exactly as they were. Safe to call at any point before the first
+ * terminal commit.
+ */
+/*
+ * The index arrays, the removal bitmaps and the work queue. None of these is
+ * part of the published graph, so both endings release them: rollback because
+ * the candidate is being discarded, and publication because ownership of the
+ * graph moved and the scratch that built it did not move with it.
+ *
+ * Shared rather than duplicated, because a scratch array added to one path
+ * and not the other leaks only on whichever ending is rarer, and until
+ * publication existed the rare one was never taken.
+ */
+static void
+restart_apply_release_scratch(struct restart_apply_context *ctx)
+{
+	free(ctx->sessions_by_id);
+	free(ctx->groups_by_record);
+	free(ctx->windows_by_id);
+	free(ctx->panes_by_id);
+	free(ctx->terminals);
+	free(ctx->survivors);
+	free(ctx->borrowed_fds);
+	free(ctx->duplicate_fds);
+	free(ctx->removed_sessions);
+	free(ctx->removed_groups);
+	free(ctx->removed_windows);
+	free(ctx->removed_panes);
+	free(ctx->work);
+}
+
+static void
+restart_apply_rollback(struct restart_apply_context *ctx)
+{
+	struct session		*s, *s1;
+	struct window		*w, *w1;
+	struct window_pane	*wp, *wp1;
+	size_t			 i;
+
+	if (ctx->terminals != NULL) {
+		i = ctx->pane_count;
+		while (i-- > 0)
+			restart_terminal_discard(ctx->terminals[i]);
+	}
+
+	RB_FOREACH_SAFE(s, sessions, &ctx->sessions, s1)
+		session_restart_destroy(&ctx->sessions, &ctx->groups, s);
+
+	/*
+	 * The candidate pane root is the authoritative owner. Walking the
+	 * windows alone reaches only panes already linked into one, so a
+	 * rollback between pane creation and list linking would release none
+	 * of them.
+	 */
+	RB_FOREACH_SAFE(wp, window_pane_tree, &ctx->panes, wp1)
+		window_pane_restart_release(&ctx->panes, wp);
+	RB_FOREACH_SAFE(w, windows, &ctx->windows, w1)
+		window_restart_destroy(&ctx->windows, &ctx->panes, w);
+
+	if (ctx->duplicate_fds != NULL) {
+		for (i = 0; i < ctx->descriptor_count; i++) {
+			if (ctx->duplicate_fds[i] != -1)
+				close(ctx->duplicate_fds[i]);
+		}
+	}
+
+	utf8_restart_discard_width_cache(ctx->utf8_cache);
+	environ_free(ctx->global_environ);
+	options_free(ctx->global_w_options);
+	options_free(ctx->global_s_options);
+	options_free(ctx->global_options);
+
+	restart_apply_release_scratch(ctx);
+	restart_apply_init(ctx);
+}
+
+static int
+restart_apply_meta(struct restart_apply_context *ctx,
+    const struct restart_state *state, char **cause)
+{
+	if (state->start_time.sec < 0 ||
+	    (int64_t)(time_t)state->start_time.sec != state->start_time.sec) {
+		restart_set_cause(cause, "restart start time is out of range");
+		return (-1);
+	}
+	ctx->start_time.tv_sec = (time_t)state->start_time.sec;
+	ctx->start_time.tv_usec = (suseconds_t)state->start_time.usec;
+
+	ctx->next_session_id = state->next_session_id;
+	ctx->next_window_id = state->next_window_id;
+	ctx->next_pane_id = state->next_pane_id;
+	ctx->next_active_point = state->next_active_point;
+
+	if (state->next_hyperlink_external_id < 1 ||
+	    state->next_hyperlink_external_id >= (uint64_t)LLONG_MAX) {
+		restart_set_cause(cause,
+		    "restart hyperlink counter is out of range");
+		return (-1);
+	}
+	ctx->next_hyperlink_external_id =
+	    (long long)state->next_hyperlink_external_id;
+	return (0);
+}
+
+static int
+restart_apply_globals(struct restart_apply_context *ctx,
+    const struct restart_state *state, char **cause)
+{
+	if (restart_options_build(&state->global_options, NULL,
+	    &ctx->global_options, cause) != 0)
+		return (-1);
+	if (restart_options_build(&state->global_session_options, NULL,
+	    &ctx->global_s_options, cause) != 0)
+		return (-1);
+	if (restart_options_build(&state->global_window_options, NULL,
+	    &ctx->global_w_options, cause) != 0)
+		return (-1);
+	ctx->global_environ = restart_environment_build(
+	    &state->global_environment);
+	ctx->utf8_cache = utf8_restart_prepare_width_cache(ctx->global_options);
+	return (0);
+}
+
+/*
+ * Rollback closes every descriptor entry that is not -1, so an array of fds
+ * is filled as part of being produced rather than by a later pass. Zeroed
+ * entries would close stdin once per descriptor.
+ */
+static int *
+restart_apply_fds(struct restart_apply_context *ctx, size_t count,
+    char **cause)
+{
+	int	*fds;
+	size_t	 i;
+
+	fds = restart_calloc(&ctx->budget, count, sizeof *fds, cause);
+	if (fds == NULL)
+		return (NULL);
+	for (i = 0; i < count; i++)
+		fds[i] = -1;
+	return (fds);
+}
+
+static int
+restart_apply_indexes(struct restart_apply_context *ctx,
+    const struct restart_state *state, char **cause)
+{
+	if (state->session_count != 0) {
+		ctx->sessions_by_id = restart_calloc(&ctx->budget,
+		    state->session_count,
+		    sizeof *ctx->sessions_by_id, cause);
+		if (ctx->sessions_by_id == NULL)
+			return (-1);
+	}
+
+	if (state->group_count != 0) {
+		ctx->groups_by_record = restart_calloc(&ctx->budget,
+		    state->group_count,
+		    sizeof *ctx->groups_by_record, cause);
+		if (ctx->groups_by_record == NULL)
+			return (-1);
+	}
+
+	if (state->window_count != 0) {
+		ctx->windows_by_id = restart_calloc(&ctx->budget,
+		    state->window_count,
+		    sizeof *ctx->windows_by_id, cause);
+		if (ctx->windows_by_id == NULL)
+			return (-1);
+	}
+
+	if (state->pane_count != 0) {
+		ctx->panes_by_id = restart_calloc(&ctx->budget,
+		    state->pane_count,
+		    sizeof *ctx->panes_by_id, cause);
+		if (ctx->panes_by_id == NULL)
+			return (-1);
+	}
+
+	if (state->pane_count != 0) {
+		ctx->terminals = restart_calloc(&ctx->budget,
+		    state->pane_count,
+		    sizeof *ctx->terminals, cause);
+		if (ctx->terminals == NULL)
+			return (-1);
+		ctx->survivors = restart_calloc(&ctx->budget,
+		    state->pane_count,
+		    sizeof *ctx->survivors, cause);
+		if (ctx->survivors == NULL)
+			return (-1);
+	}
+
+	if (state->session_count != 0) {
+		ctx->removed_sessions = restart_calloc(&ctx->budget,
+		    state->session_count,
+		    sizeof *ctx->removed_sessions, cause);
+		if (ctx->removed_sessions == NULL)
+			return (-1);
+	}
+
+	if (state->group_count != 0) {
+		ctx->removed_groups = restart_calloc(&ctx->budget,
+		    state->group_count,
+		    sizeof *ctx->removed_groups, cause);
+		if (ctx->removed_groups == NULL)
+			return (-1);
+	}
+
+	if (state->window_count != 0) {
+		ctx->removed_windows = restart_calloc(&ctx->budget,
+		    state->window_count,
+		    sizeof *ctx->removed_windows, cause);
+		if (ctx->removed_windows == NULL)
+			return (-1);
+	}
+
+	if (state->pane_count != 0) {
+		ctx->removed_panes = restart_calloc(&ctx->budget,
+		    state->pane_count,
+		    sizeof *ctx->removed_panes, cause);
+		if (ctx->removed_panes == NULL)
+			return (-1);
+	}
+
+	if (state->descriptor_count != 0) {
+		ctx->borrowed_fds = restart_apply_fds(ctx,
+		    state->descriptor_count, cause);
+		if (ctx->borrowed_fds == NULL)
+			return (-1);
+		ctx->duplicate_fds = restart_apply_fds(ctx,
+		    state->descriptor_count, cause);
+		if (ctx->duplicate_fds == NULL)
+			return (-1);
+	}
+
+	/*
+	 * One slot per object that can be removed. Every index is accepted at
+	 * most once, so this cannot overflow and the cascade needs no growth
+	 * path in the middle of an unwindable transaction.
+	 */
+	ctx->work_capacity = state->session_count + state->group_count +
+	    state->window_count + state->pane_count;
+	if (ctx->work_capacity != 0) {
+		ctx->work = restart_calloc(&ctx->budget, ctx->work_capacity,
+		    sizeof *ctx->work, cause);
+		if (ctx->work == NULL)
+			return (-1);
+	}
+
+	ctx->pane_count = state->pane_count;
+	ctx->descriptor_count = state->descriptor_count;
+	return (0);
+}
+
+static void
+restart_apply_timeval(struct timeval *tv, const struct restart_timeval *in)
+{
+	tv->tv_sec = (time_t)in->sec;
+	tv->tv_usec = (suseconds_t)in->usec;
+}
+
+static int
+restart_apply_time(int64_t value, time_t *out, char **cause)
+{
+	if ((int64_t)(time_t)value != value) {
+		restart_set_cause(cause, "restart time is out of range");
+		return (-1);
+	}
+	*out = (time_t)value;
+	return (0);
+}
+
+static int
+restart_apply_windows(struct restart_apply_context *ctx,
+    const struct restart_state *state, char **cause)
+{
+	const struct restart_window	*in;
+	struct window			*w;
+	struct options			*oo;
+	size_t				 i;
+
+	for (i = 0; i < state->window_count; i++) {
+		in = &state->windows[i];
+		if (i != 0 && in->id <= state->windows[i - 1].id) {
+			/*
+			 * Not reachable from a validated state, and not only
+			 * for the shapes tried. Validate rejects a window
+			 * with no pane and a pane list whose count disagrees
+			 * with the panes counted, so every element of this
+			 * array is searched for every state rather than for
+			 * some of them.
+			 *
+			 * Binary search finds every key only when the array
+			 * is sorted: the first midpoint must compare greater
+			 * than every key reached to its left and less than
+			 * every key reached to its right, so it partitions
+			 * correctly, and the same holds in each half. An
+			 * unordered array therefore always misses a search
+			 * first.
+			 *
+			 * Kept because that argument is about validate and
+			 * not about this function's own input.
+			 */
+			restart_set_cause(cause,
+			    "restart windows are not in ascending id order");
+			return (-1);
+		}
+		if (restart_options_build(&in->options, ctx->global_w_options,
+		    &oo, cause) != 0)
+			return (-1);
+		if (window_restart_create(&ctx->windows, in->id, in->name,
+		    in->sx, in->sy, in->xpixel, in->ypixel, oo,
+		    &w, cause) != 0) {
+			options_free(oo);
+			return (-1);
+		}
+		ctx->windows_by_id[i] = w;
+
+		w->manual_sx = in->manual_sx;
+		w->manual_sy = in->manual_sy;
+		w->new_sx = 0;
+		w->new_sy = 0;
+		w->new_xpixel = 0;
+		w->new_ypixel = 0;
+		w->lastlayout = in->last_layout;
+		w->last_new_pane_x = in->last_new_x;
+		w->last_new_pane_y = in->last_new_y;
+		restart_apply_timeval(&w->name_time, &in->name_time);
+		restart_apply_timeval(&w->activity_time, &in->activity_time);
+		restart_apply_timeval(&w->creation_time, &in->creation_time);
+	}
+	return (0);
+}
+
+static struct window *
+restart_apply_find_window(struct restart_apply_context *ctx,
+    const struct restart_state *state, uint32_t id)
+{
+	size_t	low = 0, high = state->window_count, mid;
+
+	while (low < high) {
+		mid = low + (high - low) / 2;
+		if (state->windows[mid].id == id)
+			return (ctx->windows_by_id[mid]);
+		if (state->windows[mid].id < id)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+	return (NULL);
+}
+
+static size_t
+restart_apply_find_session_index(const struct restart_state *state,
+    uint32_t id)
+{
+	size_t	low = 0, high = state->session_count, mid;
+
+	while (low < high) {
+		mid = low + (high - low) / 2;
+		if (state->sessions[mid].id == id)
+			return (mid);
+		if (state->sessions[mid].id < id)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+	return (SIZE_MAX);
+}
+
+static int
+restart_apply_pane_command(__unused struct restart_apply_context *ctx,
+    const struct restart_pane *in, struct window_pane *wp,
+    __unused char **cause)
+{
+	size_t	i;
+
+	if (in->argv.count != 0) {
+		wp->argv = xcalloc(in->argv.count + 1, sizeof *wp->argv);
+		for (i = 0; i < in->argv.count; i++) {
+			wp->argv[i] = xstrdup(in->argv.items[i]);
+			wp->argc = (int)(i + 1);
+		}
+	}
+	if (in->have_shell)
+		wp->shell = xstrdup(in->shell);
+	if (in->have_cwd)
+		wp->cwd = xstrdup(in->cwd);
+	return (0);
+}
+
+static int
+restart_apply_panes(struct restart_apply_context *ctx,
+    const struct restart_state *state, char **cause)
+{
+	const struct restart_pane	*in;
+	struct window_pane		*wp;
+	struct window			*w;
+	struct options			*oo;
+	size_t				 i;
+
+	for (i = 0; i < state->pane_count; i++) {
+		in = &state->panes[i];
+		if (i != 0 && in->id <= state->panes[i - 1].id) {
+			/*
+			 * Not reachable from a validated state, and not only
+			 * for the shapes tried. Validate rejects a window
+			 * with no pane and a pane list whose count disagrees
+			 * with the panes counted, so every element of this
+			 * array is searched for every state rather than for
+			 * some of them.
+			 *
+			 * Binary search finds every key only when the array
+			 * is sorted: the first midpoint must compare greater
+			 * than every key reached to its left and less than
+			 * every key reached to its right, so it partitions
+			 * correctly, and the same holds in each half. An
+			 * unordered array therefore always misses a search
+			 * first.
+			 *
+			 * Kept because that argument is about validate and
+			 * not about this function's own input.
+			 */
+			restart_set_cause(cause,
+			    "restart panes are not in ascending id order");
+			return (-1);
+		}
+		w = restart_apply_find_window(ctx, state, in->window_id);
+		if (w == NULL) {
+			restart_set_cause(cause,
+			    "restart pane names an unknown window");
+			return (-1);
+		}
+		if (restart_options_build(&in->options, w->options,
+		    &oo, cause) != 0)
+			return (-1);
+		if (window_pane_restart_create(&ctx->panes, w, in->id,
+		    in->active_point, in->sx, in->sy, oo,
+		    &wp, cause) != 0) {
+			options_free(oo);
+			return (-1);
+		}
+		ctx->panes_by_id[i] = wp;
+
+		wp->xoff = in->xoff;
+		wp->yoff = in->yoff;
+		wp->flags |= restart_flags_from_wire(restart_pane_flag_map,
+		    nitems(restart_pane_flag_map), in->flags);
+		wp->cmd_status = in->command_status;
+		if (restart_theme_from_wire(in->last_theme,
+		    &wp->last_theme) != 0) {
+			restart_set_cause(cause,
+			    "restart pane theme is out of range");
+			return (-1);
+		}
+		wp->output_generation = in->output_generation;
+		if (restart_apply_time(in->last_output, &wp->last_output_time,
+		    cause) != 0 ||
+		    restart_apply_time(in->last_prompt, &wp->last_prompt_time,
+		    cause) != 0 ||
+		    restart_apply_time(in->command_start, &wp->cmd_start_time,
+		    cause) != 0 ||
+		    restart_apply_time(in->command_end, &wp->cmd_end_time,
+		    cause) != 0)
+			return (-1);
+		if (restart_apply_pane_command(ctx, in, wp, cause) != 0)
+			return (-1);
+	}
+	return (0);
+}
+
+static size_t
+restart_apply_find_pane_index(const struct restart_state *state, uint32_t id)
+{
+	size_t	low = 0, high = state->pane_count, mid;
+
+	while (low < high) {
+		mid = low + (high - low) / 2;
+		if (state->panes[mid].id == id)
+			return (mid);
+		if (state->panes[mid].id < id)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+	return (SIZE_MAX);
+}
+
+/*
+ * Links one serialized id list into a window collection. The lists are built
+ * by direct insertion because they must keep their serialized order, which
+ * the stack helpers would reverse by inserting at the head. Uniqueness is
+ * enforced here: apply rebuilds these lists rather than parsing them, so the
+ * reader that rejects adjacent equal ids is not in this path.
+ */
+static int
+restart_apply_link_panes(struct restart_apply_context *ctx,
+    const struct restart_state *state, size_t window_index,
+    uint8_t *linked, uint8_t *zlinked, char **cause)
+{
+	const struct restart_window	*in = &state->windows[window_index];
+	struct window			*w = ctx->windows_by_id[window_index];
+	struct window_pane		*wp;
+	size_t				 i, index;
+
+	if (in->pane_order.count != in->z_order.count) {
+		restart_set_cause(cause,
+		    "restart pane and z orders differ in length");
+		return (-1);
+	}
+	for (i = 0; i < in->pane_order.count; i++) {
+		index = restart_apply_find_pane_index(state,
+		    in->pane_order.items[i]);
+		if (index == SIZE_MAX) {
+			restart_set_cause(cause,
+			    "restart pane order names an unknown pane");
+			return (-1);
+		}
+		wp = ctx->panes_by_id[index];
+		if (wp->window != w) {
+			restart_set_cause(cause,
+			    "restart pane order names a foreign pane");
+			return (-1);
+		}
+		if (linked[index]) {
+			restart_set_cause(cause,
+			    "restart pane order repeats a pane");
+			return (-1);
+		}
+		linked[index] = 1;
+		TAILQ_INSERT_TAIL(&w->panes, wp, entry);
+	}
+	for (i = 0; i < in->z_order.count; i++) {
+		index = restart_apply_find_pane_index(state,
+		    in->z_order.items[i]);
+		if (index == SIZE_MAX) {
+			restart_set_cause(cause,
+			    "restart z order names an unknown pane");
+			return (-1);
+		}
+		wp = ctx->panes_by_id[index];
+		if (wp->window != w) {
+			restart_set_cause(cause,
+			    "restart z order names a foreign pane");
+			return (-1);
+		}
+		if (zlinked[index]) {
+			restart_set_cause(cause,
+			    "restart z order repeats a pane");
+			return (-1);
+		}
+		zlinked[index] = 1;
+		TAILQ_INSERT_TAIL(&w->z_index, wp, zentry);
+	}
+	for (i = 0; i < in->last_panes.count; i++) {
+		index = restart_apply_find_pane_index(state,
+		    in->last_panes.items[i]);
+		if (index == SIZE_MAX) {
+			restart_set_cause(cause,
+			    "restart last panes names an unknown pane");
+			return (-1);
+		}
+		wp = ctx->panes_by_id[index];
+		if (wp->window != w) {
+			restart_set_cause(cause,
+			    "restart last panes names a foreign pane");
+			return (-1);
+		}
+		if (wp->flags & PANE_VISITED) {
+			restart_set_cause(cause,
+			    "restart last panes repeats a pane");
+			return (-1);
+		}
+		wp->flags |= PANE_VISITED;
+		TAILQ_INSERT_TAIL(&w->last_panes, wp, sentry);
+	}
+	return (0);
+}
+
+static int
+restart_apply_window_selection(struct restart_apply_context *ctx,
+    const struct restart_state *state, size_t window_index, char **cause)
+{
+	const struct restart_window	*in = &state->windows[window_index];
+	struct window			*w = ctx->windows_by_id[window_index];
+	size_t				 index;
+
+	index = restart_apply_find_pane_index(state, in->active_pane_id);
+	if (index == SIZE_MAX || ctx->panes_by_id[index]->window != w) {
+		restart_set_cause(cause, "restart window has no active pane");
+		return (-1);
+	}
+	w->active = ctx->panes_by_id[index];
+
+	if (in->have_modal) {
+		index = restart_apply_find_pane_index(state,
+		    in->modal_pane_id);
+		if (index == SIZE_MAX || ctx->panes_by_id[index]->window != w) {
+			restart_set_cause(cause,
+			    "restart window modal pane is unknown");
+			return (-1);
+		}
+		w->modal = ctx->panes_by_id[index];
+		if (w->modal != w->active) {
+			restart_set_cause(cause,
+			    "restart window modal pane is not active");
+			return (-1);
+		}
+	}
+	if (in->have_modal_last) {
+		if (!in->have_modal) {
+			restart_set_cause(cause,
+			    "restart window has modal last without modal");
+			return (-1);
+		}
+		index = restart_apply_find_pane_index(state,
+		    in->modal_last_id);
+		if (index == SIZE_MAX || ctx->panes_by_id[index]->window != w) {
+			restart_set_cause(cause,
+			    "restart window modal last pane is unknown");
+			return (-1);
+		}
+		w->modal_last = ctx->panes_by_id[index];
+		if (w->modal_last == w->modal) {
+			restart_set_cause(cause,
+			    "restart window modal last equals modal");
+			return (-1);
+		}
+	}
+	return (0);
+}
+
+static int
+restart_apply_link(struct restart_apply_context *ctx,
+    const struct restart_state *state, char **cause)
+{
+	uint8_t	*linked = NULL, *zlinked = NULL;
+	size_t	 i;
+	int	 retval = -1;
+
+	if (state->pane_count != 0) {
+		linked = restart_calloc(&ctx->budget, state->pane_count,
+		    sizeof *linked, cause);
+		if (linked == NULL)
+			return (-1);
+		zlinked = restart_calloc(&ctx->budget, state->pane_count,
+		    sizeof *zlinked, cause);
+		if (zlinked == NULL)
+			goto out;
+	}
+
+	for (i = 0; i < state->window_count; i++) {
+		if (restart_apply_link_panes(ctx, state, i, linked, zlinked,
+		    cause) != 0)
+			goto out;
+		if (restart_apply_window_selection(ctx, state, i, cause) != 0)
+			goto out;
+	}
+	for (i = 0; i < state->pane_count; i++) {
+		if (!linked[i] || !zlinked[i]) {
+			restart_set_cause(cause,
+			    "restart pane is absent from its window order");
+			goto out;
+		}
+	}
+	retval = 0;
+
+out:
+	free(zlinked);
+	free(linked);
+	return (retval);
+}
+
+
+/*
+ * Builds both layout trees for one window. An unzoomed window has only the
+ * normal tree, which becomes the live root. A zoomed window keeps the normal
+ * tree as the saved root and the visible tree as the live one, so hidden panes
+ * retain a saved cell and carry no live cell at all.
+ */
+static int
+restart_apply_window_layout(struct restart_apply_context *ctx,
+    size_t window_index, const struct restart_state *state, char **cause)
+{
+	const struct restart_window	*in = &state->windows[window_index];
+	struct window			*w = ctx->windows_by_id[window_index];
+	struct window_pane		*wp;
+	struct layout_cell		*root = NULL, *visible = NULL;
+	u_int				 zoomed = 0;
+
+	if (!(in->flags & RESTART_WINDOW_ZOOMED)) {
+		if (in->visible_layout != NULL) {
+			restart_set_cause(cause,
+			    "restart window is unzoomed with a visible layout");
+			return (-1);
+		}
+		if (restart_layout_build(in->layout, w, 0, &ctx->budget,
+		    &root, cause) != 0)
+			return (-1);
+		w->layout_root = root;
+		return (0);
+	}
+
+	if (in->visible_layout == NULL) {
+		restart_set_cause(cause,
+		    "restart window is zoomed without a visible layout");
+		return (-1);
+	}
+	if (restart_layout_build(in->layout, w, 1, &ctx->budget,
+	    &root, cause) != 0)
+		return (-1);
+	w->saved_layout_root = root;
+	if (restart_layout_build(in->visible_layout, w, 0, &ctx->budget,
+	    &visible, cause) != 0)
+		return (-1);
+	w->layout_root = visible;
+	w->flags |= restart_flags_from_wire(restart_window_flag_map,
+	    nitems(restart_window_flag_map), in->flags);
+
+	TAILQ_FOREACH(wp, &w->panes, entry) {
+		if (wp->layout_cell == NULL)
+			continue;
+		if (wp->layout_cell->flags & LAYOUT_CELL_FLOATING)
+			continue;
+		wp->flags |= PANE_ZOOMED;
+		zoomed++;
+	}
+	if (zoomed != 1) {
+		restart_set_cause(cause,
+		    "restart zoomed window has %u tiled visible panes", zoomed);
+		return (-1);
+	}
+	return (0);
+}
+
+static int
+restart_apply_layouts(struct restart_apply_context *ctx,
+    const struct restart_state *state, char **cause)
+{
+	size_t	i;
+
+	for (i = 0; i < state->window_count; i++) {
+		if (restart_apply_window_layout(ctx, i, state, cause) != 0)
+			return (-1);
+	}
+	return (0);
+}
+
+/*
+ * Materializes a termios from the symbolic control keys. Every host slot is
+ * disabled first, so a key this platform does not name is left disabled rather
+ * than inheriting whatever the zeroed struct implies.
+ */
+static int
+restart_apply_termios(const struct restart_termios_cc *in, struct termios *tio,
+    char **cause)
+{
+	const struct restart_termios_key	*key;
+	size_t					 i;
+	uint8_t					 value;
+
+	memset(tio, 0, sizeof *tio);
+	for (i = 0; i < NCCS; i++)
+		tio->c_cc[i] = _POSIX_VDISABLE;
+
+	for (i = 0; i < nitems(restart_termios_keys); i++) {
+		key = &restart_termios_keys[i];
+		if (!(in->present & (1U << (key->key - 1))))
+			continue;
+		if (key->index >= NCCS) {
+			if (!key->required)
+				continue;
+			restart_set_cause(cause,
+			    "unsupported restart terminal control key %u",
+			    key->key);
+			return (-1);
+		}
+		value = in->value[key->key - 1];
+		if ((uint8_t)(cc_t)value != value) {
+			restart_set_cause(cause,
+			    "restart terminal control value is out of range");
+			return (-1);
+		}
+		tio->c_cc[key->index] = (cc_t)value;
+	}
+	if ((in->present & RESTART_TERMIOS_REQUIRED) !=
+	    RESTART_TERMIOS_REQUIRED) {
+		restart_set_cause(cause,
+		    "missing required restart terminal control key");
+		return (-1);
+	}
+	return (0);
+}
+
+static int
+restart_apply_sessions(struct restart_apply_context *ctx,
+    const struct restart_state *state, char **cause)
+{
+	const struct restart_session	*in;
+	struct session			*sn;
+	struct options			*oo;
+	struct environ			*env;
+	struct termios			 tio;
+	size_t				 i;
+
+	for (i = 0; i < state->session_count; i++) {
+		in = &state->sessions[i];
+		if (i != 0 && in->id <= state->sessions[i - 1].id) {
+			restart_set_cause(cause,
+			    "restart sessions are not in ascending id order");
+			return (-1);
+		}
+		if (in->have_termios &&
+		    restart_apply_termios(&in->termios_cc, &tio, cause) != 0)
+			return (-1);
+		if (restart_options_build(&in->options, ctx->global_s_options,
+		    &oo, cause) != 0)
+			return (-1);
+		env = restart_environment_build(&in->environment);
+		if (session_restart_create(&ctx->sessions, in->id, in->name,
+		    in->cwd, env, oo, in->have_termios ? &tio : NULL,
+		    &sn, cause) != 0) {
+			environ_free(env);
+			options_free(oo);
+			return (-1);
+		}
+		ctx->sessions_by_id[i] = sn;
+
+		restart_apply_timeval(&sn->creation_time, &in->creation_time);
+		restart_apply_timeval(&sn->last_attached_time,
+		    &in->last_attached_time);
+		restart_apply_timeval(&sn->activity_time, &in->activity_time);
+		restart_apply_timeval(&sn->last_activity_time,
+		    &in->last_activity_time);
+	}
+	return (0);
+}
+
+/*
+ * Links one session's winlinks. Order is serialized: winlinks ascend by index,
+ * and the last stack is most recent first, so both are built by direct
+ * insertion with WINLINK_VISITED set only for stack members.
+ */
+static int
+restart_apply_session_winlinks(struct restart_apply_context *ctx,
+    const struct restart_state *state, size_t session_index, char **cause)
+{
+	const struct restart_session	*in = &state->sessions[session_index];
+	struct session			*sn;
+	struct window			*w;
+	struct winlink			*wl;
+	size_t				 i;
+	int				 found = 0;
+
+	sn = ctx->sessions_by_id[session_index];
+
+	for (i = 0; i < in->winlink_count; i++) {
+		/*
+		 * A strict-increase check guarded by i != 0 validates the
+		 * ordering and never the first element's domain. Winlink index
+		 * is the only signed key apply consumes, and tmux encodes an
+		 * automatic-allocation request as a negative index, so a
+		 * negative stored index would publish a session whose next
+		 * checkpoint the following restart's reader rejects.
+		 */
+		if (in->winlinks[i].index < 0) {
+			restart_set_cause(cause,
+			    "restart winlink index is negative");
+			return (-1);
+		}
+		if (i != 0 &&
+		    in->winlinks[i].index <= in->winlinks[i - 1].index) {
+			restart_set_cause(cause,
+			    "restart winlinks are not in ascending index "
+			    "order");
+			return (-1);
+		}
+		w = restart_apply_find_window(ctx, state,
+		    in->winlinks[i].window_id);
+		if (w == NULL) {
+			restart_set_cause(cause,
+			    "restart winlink names an unknown window");
+			return (-1);
+		}
+		if (winlink_restart_create(sn, w, in->winlinks[i].index,
+		    in->winlinks[i].flags,
+		    &wl, cause) != 0)
+			return (-1);
+		if (in->winlinks[i].index == in->current_index) {
+			sn->curw = wl;
+			found = 1;
+		}
+	}
+	if (in->winlink_count != 0 && !found) {
+		restart_set_cause(cause,
+		    "restart session current index has no winlink");
+		return (-1);
+	}
+
+	for (i = 0; i < in->last_indices.count; i++) {
+		wl = winlink_find_by_index(&sn->windows,
+		    in->last_indices.items[i]);
+		if (wl == NULL) {
+			restart_set_cause(cause,
+			    "restart last index has no winlink");
+			return (-1);
+		}
+		if (wl == sn->curw) {
+			restart_set_cause(cause,
+			    "restart last stack contains the current winlink");
+			return (-1);
+		}
+		if (wl->flags & WINLINK_VISITED) {
+			restart_set_cause(cause,
+			    "restart last stack repeats a winlink");
+			return (-1);
+		}
+		wl->flags |= WINLINK_VISITED;
+		TAILQ_INSERT_TAIL(&sn->lastw, wl, sentry);
+	}
+	return (0);
+}
+
+static int
+restart_apply_groups(struct restart_apply_context *ctx,
+    const struct restart_state *state, uint8_t *grouped, char **cause)
+{
+	const struct restart_group	*in;
+	struct session_group		*sg;
+	struct session			*sn;
+	size_t				 i, j, index;
+
+	for (i = 0; i < state->group_count; i++) {
+		in = &state->groups[i];
+		if (i != 0 &&
+		    strcmp(in->name, state->groups[i - 1].name) <= 0) {
+			restart_set_cause(cause,
+			    "restart groups are not in bytewise name order");
+			return (-1);
+		}
+		if (session_group_restart_create(&ctx->groups, in->name,
+		    &sg, cause) != 0)
+			return (-1);
+		ctx->groups_by_record[i] = sg;
+		if (in->members.count == 0) {
+			restart_set_cause(cause, "restart group is empty");
+			return (-1);
+		}
+		for (j = 0; j < in->members.count; j++) {
+			index = restart_apply_find_session_index(state,
+			    in->members.items[j]);
+			if (index == SIZE_MAX) {
+				restart_set_cause(cause,
+				    "restart group names an unknown session");
+				return (-1);
+			}
+			if (grouped[index]) {
+				restart_set_cause(cause,
+				    "restart session is in two groups");
+				return (-1);
+			}
+			grouped[index] = 1;
+			sn = ctx->sessions_by_id[index];
+			session_group_restart_add(sg, sn);
+		}
+	}
+	return (0);
+}
+
+static int
+restart_apply_link_sessions(struct restart_apply_context *ctx,
+    const struct restart_state *state, char **cause)
+{
+	uint8_t	*grouped = NULL;
+	size_t	 i;
+	int	 retval = -1;
+
+	for (i = 0; i < state->session_count; i++) {
+		if (restart_apply_session_winlinks(ctx, state, i, cause) != 0)
+			return (-1);
+	}
+	if (state->session_count != 0) {
+		grouped = restart_calloc(&ctx->budget, state->session_count,
+		    sizeof *grouped, cause);
+		if (grouped == NULL)
+			return (-1);
+	}
+	retval = restart_apply_groups(ctx, state, grouped, cause);
+	free(grouped);
+	return (retval);
+}
+
+/*
+ * Builds a candidate wait status without preserving wire-foreign bits, then
+ * requires the host macros to round-trip the requested kind and value. A
+ * platform whose encoding does not agree fails the apply rather than
+ * publishing a status the runtime would misread.
+ */
+static int
+restart_apply_wait_status(uint8_t kind, uint32_t value, int *out, char **cause)
+{
+	int	status;
+
+	switch (kind) {
+	case RESTART_DEAD_EXITED:
+		if (value > 0xff) {
+			restart_set_cause(cause,
+			    "restart exit status is out of range");
+			return (-1);
+		}
+		status = (int)((value & 0xff) << 8);
+		if (!WIFEXITED(status) ||
+		    (uint32_t)WEXITSTATUS(status) != value) {
+			restart_set_cause(cause,
+			    "host wait macros do not round-trip an exit "
+			    "status");
+			return (-1);
+		}
+		break;
+	case RESTART_DEAD_SIGNALED:
+		if (value == 0 || value > 0xff) {
+			restart_set_cause(cause,
+			    "restart exit signal is out of range");
+			return (-1);
+		}
+		status = (int)value;
+		if (!WIFSIGNALED(status) ||
+		    (uint32_t)WTERMSIG(status) != value) {
+			restart_set_cause(cause,
+			    "host wait macros do not round-trip a signal");
+			return (-1);
+		}
+		break;
+	default:
+		restart_set_cause(cause, "unknown restart exit kind");
+		return (-1);
+	}
+	*out = status;
+	return (0);
+}
+
+/*
+ * Derives the runtime state for one pane from its serialized lifecycle. The
+ * descriptor-backed lifecycles get their fd and event later; this sets only
+ * the flags, status and times, and leaves lifecycle 7 in its pre-finalization
+ * form.
+ */
+static int
+restart_apply_pane_lifecycle(const struct restart_pane *in,
+    struct window_pane *wp, char **cause)
+{
+	int	known = 0, exited = 0, drawn = 0, empty = 0;
+
+	wp->status = 0;
+	timerclear(&wp->dead_time);
+	wp->pid = -1;
+
+	switch (in->lifecycle) {
+	case RESTART_LIFECYCLE_LIVE_FD:
+		break;
+	case RESTART_LIFECYCLE_EMPTY:
+		empty = 1;
+		break;
+	case RESTART_LIFECYCLE_DEAD_KNOWN:
+		exited = known = drawn = 1;
+		break;
+	case RESTART_LIFECYCLE_DEAD_UNKNOWN:
+		exited = drawn = 1;
+		break;
+	case RESTART_LIFECYCLE_DRAINING_KNOWN:
+		exited = known = 1;
+		break;
+	case RESTART_LIFECYCLE_DRAINING_UNKNOWN:
+		exited = 1;
+		break;
+	case RESTART_LIFECYCLE_EXITED_UNKNOWN:
+		exited = 1;
+		break;
+	case RESTART_LIFECYCLE_INACTIVE:
+		break;
+	default:
+		restart_set_cause(cause, "unknown restart pane lifecycle");
+		return (-1);
+	}
+
+	if (in->lifecycle != RESTART_LIFECYCLE_INACTIVE &&
+	    in->lifecycle != RESTART_LIFECYCLE_EMPTY) {
+		if (in->pid <= 0 || (int64_t)(pid_t)in->pid != in->pid) {
+			restart_set_cause(cause,
+			    "restart pane pid is out of range");
+			return (-1);
+		}
+		wp->pid = (pid_t)in->pid;
+	}
+
+	if (known) {
+		if (!in->have_result) {
+			restart_set_cause(cause,
+			    "restart known pane has no exit result");
+			return (-1);
+		}
+		if (restart_apply_wait_status(in->dead_kind, in->dead_value,
+		    &wp->status, cause) != 0)
+			return (-1);
+	} else if (in->have_result) {
+		restart_set_cause(cause,
+		    "restart unknown pane carries an exit result");
+		return (-1);
+	}
+
+	if (in->have_dead_time) {
+		if (in->lifecycle != RESTART_LIFECYCLE_DEAD_KNOWN &&
+		    in->lifecycle != RESTART_LIFECYCLE_DEAD_UNKNOWN) {
+			restart_set_cause(cause,
+			    "restart pane carries an unexpected dead time");
+			return (-1);
+		}
+		restart_apply_timeval(&wp->dead_time, &in->dead_time);
+	} else if (in->lifecycle == RESTART_LIFECYCLE_DEAD_KNOWN ||
+	    in->lifecycle == RESTART_LIFECYCLE_DEAD_UNKNOWN) {
+		restart_set_cause(cause, "restart dead pane has no dead time");
+		return (-1);
+	}
+
+	if (empty)
+		wp->flags |= PANE_EMPTY;
+	if (exited)
+		wp->flags |= PANE_EXITED;
+	if (known)
+		wp->flags |= PANE_STATUSREADY;
+	if (drawn)
+		wp->flags |= PANE_STATUSDRAWN;
+	wp->flags |= PANE_REDRAW|PANE_STYLECHANGED|PANE_THEMECHANGED;
+	return (0);
+}
+
+static int
+restart_apply_lifecycles(struct restart_apply_context *ctx,
+    const struct restart_state *state, char **cause)
+{
+	size_t	i;
+
+	for (i = 0; i < state->pane_count; i++) {
+		if (restart_apply_pane_lifecycle(&state->panes[i],
+		    ctx->panes_by_id[i], cause) != 0)
+			return (-1);
+	}
+	return (0);
+}
+
+/*
+ * Resolves each descriptor exactly once, in canonical pane id order, and
+ * transfers one close-on-exec duplicate to the pane only after its bufferevent
+ * exists. The callback descriptor is borrowed throughout and is never closed
+ * here.
+ *
+ * Ordering is asserted rather than assumed: the reader enforces it, but a DTO
+ * handed to apply directly does not pass through the reader, and this loop
+ * relies on the order to reject a repeated key.
+ */
+/*
+ * Name an adopted pane's terminal from the inherited master rather than from
+ * the checkpoint: an empty name matches no client, and a stale one would match
+ * the wrong one. spawn.c fills this field for panes it creates; a pane adopted
+ * from a descriptor has never been through it.
+ */
+static int
+restart_pane_adopt_tty(struct window_pane *wp, int fd, const char *recorded,
+    char **cause)
+{
+	const char	*name;
+
+	name = ptsname(fd);
+	if (name == NULL) {
+		restart_set_cause(cause,
+		    "restart descriptor has no terminal name");
+		return (-1);
+	}
+	if (recorded != NULL && strcmp(name, recorded) != 0) {
+		log_debug("%s: pane %%%u terminal name changed across restart, "
+		    "recorded %s, actual %s", __func__, wp->id, recorded, name);
+	}
+	strlcpy(wp->tty, name, sizeof wp->tty);
+	return (0);
+}
+
+static int
+restart_apply_descriptors(struct restart_apply_context *ctx,
+    const struct restart_state *state, restart_fd_lookup_cb lookup, void *arg,
+    char **cause)
+{
+	const struct restart_descriptor_key	*key;
+	struct window_pane			*wp;
+	size_t					 i, j, index;
+	uint8_t					 lifecycle;
+	int					 fd, dup;
+
+	for (i = 0; i < state->descriptor_count; i++) {
+		key = &state->descriptors[i];
+		if (i != 0 &&
+		    key->pane_id <= state->descriptors[i - 1].pane_id) {
+			restart_set_cause(cause,
+			    "restart descriptor keys are not in ascending "
+			    "pane order");
+			return (-1);
+		}
+		index = restart_apply_find_pane_index(state, key->pane_id);
+		if (index == SIZE_MAX) {
+			restart_set_cause(cause,
+			    "restart descriptor names an unknown pane");
+			return (-1);
+		}
+		wp = ctx->panes_by_id[index];
+		lifecycle = state->panes[index].lifecycle;
+		if ((lifecycle != RESTART_LIFECYCLE_LIVE_FD &&
+		    lifecycle != RESTART_LIFECYCLE_DRAINING_KNOWN &&
+		    lifecycle != RESTART_LIFECYCLE_DRAINING_UNKNOWN &&
+		    lifecycle != RESTART_LIFECYCLE_EXITED_UNKNOWN) ||
+		    (wp->flags & PANE_STATUSDRAWN)) {
+			restart_set_cause(cause,
+			    "restart descriptor names a pane without a live "
+			    "stream");
+			return (-1);
+		}
+		if (key->pid <= 0 || (int64_t)(pid_t)key->pid != key->pid ||
+		    (pid_t)key->pid != wp->pid) {
+			restart_set_cause(cause,
+			    "restart descriptor pid does not match its pane");
+			return (-1);
+		}
+
+		fd = -1;
+		if (lookup(arg, key->pane_id, (pid_t)key->pid, &fd) != 0 ||
+		    fd < 0) {
+			restart_set_cause(cause,
+			    "restart descriptor lookup failed");
+			return (-1);
+		}
+		if (fcntl(fd, F_GETFD) == -1) {
+			restart_set_cause(cause,
+			    "restart descriptor is not open");
+			return (-1);
+		}
+		for (j = 0; j < i; j++) {
+			if (ctx->borrowed_fds[j] == fd) {
+				restart_set_cause(cause,
+				    "restart descriptor callback reused a "
+				    "descriptor");
+				return (-1);
+			}
+		}
+		ctx->borrowed_fds[i] = fd;
+
+		if ((fcntl(fd, F_GETFL) & O_NONBLOCK) == 0) {
+			restart_set_cause(cause,
+			    "restart descriptor is not nonblocking");
+			return (-1);
+		}
+
+		/*
+		 * Duplicate above the standard descriptors, so that a pane
+		 * never lands on 0, 1 or 2 when one of those is closed.
+		 */
+		dup = fcntl(fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+		if (dup == -1) {
+			restart_set_cause(cause,
+			    "restart descriptor duplication failed");
+			return (-1);
+		}
+		ctx->duplicate_fds[i] = dup;
+
+		if (window_pane_restart_set_event(wp, dup, cause) != 0)
+			return (-1);
+		wp->fd = dup;
+		ctx->duplicate_fds[i] = -1;
+
+		if (restart_pane_adopt_tty(wp, dup, state->panes[index].tty,
+		    cause) != 0)
+			return (-1);
+	}
+	return (0);
+}
+
+/*
+ * Nonallocating reference algebra over the built graph. Runs before any
+ * lifecycle-7 cascade and again after it, so a cascade that drops a reference
+ * or strands a reverse link is caught before anything is published. Counts are
+ * checked against the DTO counts rather than accumulated freely, so an
+ * overflow cannot pass as a match.
+ */
+/*
+ * Accept work for an object, once. Returns zero if it was already accepted,
+ * which is how a pointer reached from two directions is acted on exactly
+ * once.
+ */
+static int
+restart_apply_queue(struct restart_apply_context *ctx,
+    enum restart_work_kind kind, size_t index)
+{
+	uint8_t	*removed;
+
+	switch (kind) {
+	case RESTART_WORK_PANE:
+		removed = ctx->removed_panes;
+		break;
+	case RESTART_WORK_WINDOW:
+		removed = ctx->removed_windows;
+		break;
+	case RESTART_WORK_SESSION:
+		removed = ctx->removed_sessions;
+		break;
+	default:
+		removed = ctx->removed_groups;
+		break;
+	}
+	if (removed == NULL || removed[index])
+		return (0);
+	removed[index] = 1;
+
+	ctx->work[ctx->work_count].kind = kind;
+	ctx->work[ctx->work_count].index = index;
+	ctx->work_count++;
+	return (1);
+}
+
+static size_t
+restart_apply_find_window_index(const struct restart_state *state, uint32_t id)
+{
+	size_t	low = 0, high = state->window_count, mid;
+
+	while (low < high) {
+		mid = low + (high - low) / 2;
+		if (state->windows[mid].id == id)
+			return (mid);
+		if (state->windows[mid].id < id)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+	return (SIZE_MAX);
+}
+
+/*
+ * Retain an exited-unknown pane as the observable lifecycle-4 state.
+ *
+ * One current time is taken before anything changes, so every pane retained
+ * in one apply agrees. No hook, no format expansion and no screen mutation:
+ * the checkpointed terminal has to stay byte exact, and remain-on-exit-format
+ * is drawn by the runtime path rather than by startup finalization.
+ */
+static void
+restart_apply_retain_exited(struct window_pane *wp)
+{
+	struct timeval	tv;
+
+	gettimeofday(&tv, NULL);
+	wp->dead_time = tv;
+
+	wp->flags |= PANE_STATUSDRAWN;
+	wp->flags &= ~PANE_STATUSREADY;
+}
+
+static int restart_apply_remove_pane(struct restart_apply_context *,
+    const struct restart_state *, size_t, char **);
+static int restart_apply_remove_window(struct restart_apply_context *,
+    const struct restart_state *, size_t, char **);
+static int restart_apply_remove_session(struct restart_apply_context *,
+    const struct restart_state *, size_t, char **);
+static int restart_apply_remove_group(struct restart_apply_context *,
+    const struct restart_state *, size_t, char **);
+
+/*
+ * Which candidate group holds this session, by record index.
+ *
+ * session_group_contains walks the live root, which is empty during apply, so
+ * membership has to be resolved against the candidate groups instead.
+ */
+static size_t
+restart_apply_find_group_record(struct restart_apply_context *ctx,
+    const struct restart_state *state, struct session *s)
+{
+	struct session_group	*sg;
+	struct session		*member;
+	size_t			 i;
+
+	for (i = 0; i < state->group_count; i++) {
+		sg = ctx->groups_by_record[i];
+		if (sg == NULL)
+			continue;
+		TAILQ_FOREACH(member, &sg->sessions, gentry) {
+			if (member == s)
+				return (i);
+		}
+	}
+	return (SIZE_MAX);
+}
+
+static int
+restart_apply_remove_pane(struct restart_apply_context *ctx,
+    const struct restart_state *state, size_t index, char **cause)
+{
+	struct window_pane	*wp = ctx->panes_by_id[index];
+	struct window		*w;
+	size_t			 windex;
+
+	if (wp == NULL)
+		return (0);
+	w = wp->window;
+
+	if (w != NULL)
+		layout_restart_remove_pane(w, wp);
+
+	window_pane_restart_remove(&ctx->panes, wp);
+	ctx->panes_by_id[index] = NULL;
+
+	if (w != NULL && TAILQ_EMPTY(&w->panes)) {
+		windex = restart_apply_find_window_index(state, w->id);
+		if (windex == SIZE_MAX) {
+			restart_set_cause(cause,
+			    "restart cascade reached an unknown window");
+			return (-1);
+		}
+		restart_apply_queue(ctx, RESTART_WORK_WINDOW, windex);
+	}
+	return (0);
+}
+
+static int
+restart_apply_remove_window(struct restart_apply_context *ctx,
+    const struct restart_state *state, size_t index, char **cause)
+{
+	struct window		*w = ctx->windows_by_id[index];
+	struct window_pane	*wp, *wp1;
+	struct session		*s;
+	struct winlink		*wl, *wl1;
+	size_t			 i, pindex;
+
+	if (w == NULL)
+		return (0);
+
+	RB_FOREACH_SAFE(wp, window_pane_tree, &ctx->panes, wp1) {
+		if (wp->window != w)
+			continue;
+		pindex = restart_apply_find_pane_index(state, wp->id);
+		if (pindex == SIZE_MAX) {
+			restart_set_cause(cause,
+			    "restart cascade reached an unknown pane");
+			return (-1);
+		}
+		if (restart_apply_queue(ctx, RESTART_WORK_PANE, pindex) &&
+		    restart_apply_remove_pane(ctx, state, pindex, cause) != 0)
+			return (-1);
+	}
+
+	for (i = 0; i < state->session_count; i++) {
+		s = ctx->sessions_by_id[i];
+		if (s == NULL)
+			continue;
+		RB_FOREACH_SAFE(wl, winlinks, &s->windows, wl1) {
+			if (wl->window != w)
+				continue;
+			session_restart_unlink(s, wl);
+			if (RB_EMPTY(&s->windows))
+				restart_apply_queue(ctx, RESTART_WORK_SESSION,
+				    i);
+		}
+	}
+
+	window_restart_destroy(&ctx->windows, &ctx->panes, w);
+	ctx->windows_by_id[index] = NULL;
+	return (0);
+}
+
+static int
+restart_apply_remove_session(struct restart_apply_context *ctx,
+    const struct restart_state *state, size_t index, char **cause)
+{
+	struct session	*s = ctx->sessions_by_id[index];
+	size_t		 i;
+
+	(void)cause;
+
+	if (s == NULL)
+		return (0);
+
+	/*
+	 * A group loses its whole membership with any member, because a
+	 * surviving group with one absent member is a state the live server
+	 * never produces.
+	 *
+	 * This does not fire for a valid graph and is kept for one that is
+	 * not. Members hold identical window sets, which capture enforces,
+	 * and a session is queued only on losing its last winlink, so every
+	 * member loses it in the same window-removal loop and is queued
+	 * there. By the time this runs, each is already marked removed and
+	 * the queue call is a no-op. Removing it changes no observable
+	 * outcome, which was measured rather than assumed.
+	 */
+	i = restart_apply_find_group_record(ctx, state, s);
+	if (i != SIZE_MAX)
+		restart_apply_queue(ctx, RESTART_WORK_GROUP, i);
+
+	session_restart_destroy(&ctx->sessions, &ctx->groups, s);
+	ctx->sessions_by_id[index] = NULL;
+	return (0);
+}
+
+static int
+restart_apply_remove_group(struct restart_apply_context *ctx,
+    const struct restart_state *state, size_t index, char **cause)
+{
+	struct session	*s;
+	size_t		 i;
+
+	for (i = 0; i < state->session_count; i++) {
+		s = ctx->sessions_by_id[i];
+		if (s == NULL ||
+		    restart_apply_find_group_record(ctx, state, s) != index)
+			continue;
+		if (restart_apply_queue(ctx, RESTART_WORK_SESSION, i) &&
+		    restart_apply_remove_session(ctx, state, i, cause) != 0)
+			return (-1);
+	}
+	return (0);
+}
+
+static int
+restart_apply_drain(struct restart_apply_context *ctx,
+    const struct restart_state *state, char **cause)
+{
+	struct restart_work	*item;
+
+	while (ctx->work_head < ctx->work_count) {
+		item = &ctx->work[ctx->work_head++];
+		switch (item->kind) {
+		case RESTART_WORK_PANE:
+			if (restart_apply_remove_pane(ctx, state, item->index,
+			    cause) != 0)
+				return (-1);
+			break;
+		case RESTART_WORK_WINDOW:
+			if (restart_apply_remove_window(ctx, state,
+			    item->index, cause) != 0)
+				return (-1);
+			break;
+		case RESTART_WORK_SESSION:
+			if (restart_apply_remove_session(ctx, state,
+			    item->index, cause) != 0)
+				return (-1);
+			break;
+		case RESTART_WORK_GROUP:
+			if (restart_apply_remove_group(ctx, state,
+			    item->index, cause) != 0)
+				return (-1);
+			break;
+		}
+	}
+	return (0);
+}
+
+/*
+ * Step 14: finalize every lifecycle-7 pane before caches or terminals exist,
+ * so no removed pane ever allocates a derived cache or a prepared terminal.
+ */
+static int
+restart_apply_lifecycles_final(struct restart_apply_context *ctx,
+    const struct restart_state *state, char **cause)
+{
+	const struct restart_pane	*in;
+	struct window_pane		*wp;
+	size_t				 i;
+	int				 remain;
+
+	for (i = 0; i < state->pane_count; i++) {
+		in = &state->panes[i];
+		if (in->lifecycle != RESTART_LIFECYCLE_EXITED_UNKNOWN)
+			continue;
+		wp = ctx->panes_by_id[i];
+		if (wp == NULL)
+			continue;
+
+		/*
+		 * Only "off" removes. The other four retain because the exit
+		 * status is unknown, so success cannot be ruled out.
+		 */
+		remain = options_get_number(wp->options, "remain-on-exit");
+		if (remain != 0) {
+			restart_apply_retain_exited(wp);
+			continue;
+		}
+		if (restart_apply_queue(ctx, RESTART_WORK_PANE, i) &&
+		    restart_apply_remove_pane(ctx, state, i, cause) != 0)
+			return (-1);
+	}
+
+	if (restart_apply_drain(ctx, state, cause) != 0)
+		return (-1);
+
+	/*
+	 * No lifecycle 7 may be observable after this point: every one was
+	 * either retained as the lifecycle-4 state or removed. A survivor
+	 * here would reach terminal preparation as a state the live server
+	 * cannot represent.
+	 */
+	for (i = 0; i < state->pane_count; i++) {
+		if (state->panes[i].lifecycle !=
+		    RESTART_LIFECYCLE_EXITED_UNKNOWN)
+			continue;
+		wp = ctx->panes_by_id[i];
+		if (wp != NULL && !(wp->flags & PANE_STATUSDRAWN)) {
+			restart_set_cause(cause,
+			    "restart lifecycle 7 survived finalization");
+			return (-1);
+		}
+	}
+	return (0);
+}
+
+static size_t
+restart_apply_removed_count(const uint8_t *removed, size_t count)
+{
+	size_t	i, n = 0;
+
+	if (removed == NULL)
+		return (0);
+	for (i = 0; i < count; i++) {
+		if (removed[i])
+			n++;
+	}
+	return (n);
+}
+
+/*
+ * Step 15, first stage: window scrollbar flags and position.
+ *
+ * Read from the candidate window's own option tree. Nothing here consults a
+ * live root, which is the property the probe checks by poisoning the live
+ * tables rather than by emptying them: an empty table and a correct candidate
+ * table agree on any defaulted value, so emptiness cannot tell reading from
+ * not reading.
+ */
+static void
+restart_derive_window_scrollbars(struct restart_apply_context *ctx)
+{
+	struct window	*w;
+
+	RB_FOREACH(w, windows, &ctx->windows) {
+		w->sb = options_get_number(w->options, "pane-scrollbars");
+		w->sb_pos = options_get_number(w->options,
+		    "pane-scrollbars-position");
+	}
+}
+
+/*
+ * Step 15, second stage: every surviving pane's scrollbar style.
+ *
+ * After the window stage, because the width this produces is what the final
+ * geometry pass in step 16 subtracts from each pane.
+ */
+static int
+restart_derive_pane_scrollbars(struct restart_apply_context *ctx, char **cause)
+{
+	struct window_pane	*wp;
+
+	RB_FOREACH(wp, window_pane_tree, &ctx->panes) {
+		if (style_restart_scrollbar(&wp->scrollbar_style, wp->options,
+		    wp, cause) != 0)
+			return (-1);
+	}
+	return (0);
+}
+
+/*
+ * Step 15, third stage: both fill cells, from the final active pane.
+ *
+ * The live derivation is reused rather than reimplemented. It already sets
+ * FORMAT_NOJOBS, reads the window's own option tree and takes its active
+ * pane, and the cells it produces are inline members, so it retains no
+ * allocation for the transaction to own. Whether it reaches a live root
+ * anyway is not settled by reading it, so the probe poisons fill-character
+ * and requires the candidate value to be unchanged.
+ */
+static void
+restart_derive_fill_cells(struct restart_apply_context *ctx)
+{
+	struct window	*w;
+
+	RB_FOREACH(w, windows, &ctx->windows)
+		window_set_fill_cells(w);
+}
+
+/*
+ * Step 15, fourth stage: every surviving pane's default palette.
+ *
+ * Last, and complete before terminal preparation, because preparation reads
+ * the palette when it moves colour state and a pane whose defaults are not
+ * yet derived would be prepared against an empty one.
+ */
+static int
+restart_derive_palettes(struct restart_apply_context *ctx,
+    __unused char **cause)
+{
+	struct window_pane	*wp;
+
+	RB_FOREACH(wp, window_pane_tree, &ctx->panes) {
+		colour_palette_from_option(&wp->palette, wp->options);
+	}
+	return (0);
+}
+
+static int
+restart_apply_derive(struct restart_apply_context *ctx, char **cause)
+{
+	restart_derive_window_scrollbars(ctx);
+	if (restart_derive_pane_scrollbars(ctx, cause) != 0)
+		return (-1);
+	restart_derive_fill_cells(ctx);
+	if (restart_derive_palettes(ctx, cause) != 0)
+		return (-1);
+	return (0);
+}
+
+/*
+ * Step 16, first part: final offsets and dimensions.
+ *
+ * After derivation rather than before, because the widths this subtracts are
+ * what step 15 produced. Running it earlier yields a pane sized against the
+ * default scrollbar width, which still renders and is therefore wrong in a
+ * way nothing downstream reports.
+ */
+static void
+restart_apply_geometry(struct restart_apply_context *ctx)
+{
+	struct window	*w;
+
+	RB_FOREACH(w, windows, &ctx->windows) {
+		if (w->layout_root == NULL)
+			continue;
+		layout_fix_offsets(w);
+		layout_restart_fix_panes(w);
+	}
+}
+
+/*
+ * Step 16, second part: prepare each surviving pane's terminal.
+ *
+ * Nothing is committed here. The prepared state stays detached, so the
+ * process-global hyperlink and image lists are untouched until the no-fail
+ * commit boundary, and rollback discards each prepared terminal through the
+ * array this fills.
+ *
+ * Indexed by pane position rather than appended, so a removed pane leaves a
+ * NULL rather than shifting its neighbours, which is what lets rollback walk
+ * the array without knowing which panes survived.
+ */
+static int
+restart_apply_prepare_terminals(struct restart_apply_context *ctx,
+    const struct restart_state *state, char **cause)
+{
+	struct window_pane	*wp;
+	size_t			 i;
+	u_int			 final_sx, final_sy;
+
+	for (i = 0; i < state->pane_count; i++) {
+		wp = ctx->panes_by_id[i];
+		if (wp == NULL)
+			continue;
+		if (state->panes[i].terminal == NULL) {
+			restart_set_cause(cause,
+			    "restart pane has no terminal state");
+			return (-1);
+		}
+		if (restart_terminal_prepare(state->panes[i].terminal, wp,
+		    &ctx->budget, &ctx->terminals[i], cause) != 0)
+			return (-1);
+
+		/*
+		 * Final geometry comes from the layout pass and the serialized
+		 * geometry is what the child still believes, so a pane whose
+		 * two disagree owes its child one resize.
+		 */
+		if (wp->sx == state->panes[i].sx &&
+		    wp->sy == state->panes[i].sy)
+			continue;
+		if (restart_terminal_resize_prepared(ctx->terminals[i],
+		    wp->sx, wp->sy, cause) != 0)
+			return (-1);
+
+		/*
+		 * Stage against the serialized dimensions rather than the
+		 * current ones. The pane already holds its final size, so the
+		 * old size the child needs told about is the serialized one,
+		 * and the helper reads the pane to fill it. Restoring it for
+		 * the call is what makes the record describe the child's
+		 * transition rather than an internal one.
+		 */
+		final_sx = wp->sx;
+		final_sy = wp->sy;
+		wp->sx = state->panes[i].sx;
+		wp->sy = state->panes[i].sy;
+		if (window_pane_restart_stage_resize(wp, final_sx, final_sy,
+		    cause) != 0) {
+			wp->sx = final_sx;
+			wp->sy = final_sy;
+			return (-1);
+		}
+	}
+	return (0);
+}
+
+/*
+ * Step 17: one aggregate capacity preflight over the complete surviving
+ * batch, then the second reference pass.
+ *
+ * One call, never one per pane. The preflight accumulates across the batch
+ * before a single check, so a loop would pass every element individually and
+ * still exceed the total, and during apply the global counts start at zero so
+ * each element clears the limit trivially. The count passed is asserted equal
+ * to the survivor count held independently, which is a thing a loop cannot
+ * satisfy.
+ */
+static int
+restart_apply_preflight(struct restart_apply_context *ctx,
+    const struct restart_state *state, char **cause)
+{
+	size_t	i, n = 0, survivors = 0;
+
+	for (i = 0; i < state->pane_count; i++) {
+		if (ctx->panes_by_id[i] != NULL)
+			survivors++;
+		if (ctx->terminals[i] != NULL)
+			ctx->survivors[n++] = ctx->terminals[i];
+	}
+	if (n != survivors) {
+		restart_set_cause(cause,
+		    "restart prepared terminals do not cover the survivors");
+		return (-1);
+	}
+	return (restart_terminal_preflight_batch(ctx->survivors, n, cause));
+}
+
+/*
+ * Step 18: cross the commit boundary and publish.
+ *
+ * Nothing here may fail. Every fallible action has already run, every
+ * allocation the graph needs is charged and held, and each call below either
+ * returns void or cannot report an error. A fallible call added here would
+ * leave a graph half installed with no way back, because the candidate roots
+ * are emptied as ownership moves and there is nothing left to unwind to.
+ *
+ * Panes commit in ascending id order, which is the order their terminals were
+ * prepared and the order the eviction lists will hold them in.
+ */
+/*
+ * Hand each restored pane's staged resize to its child and arm its event.
+ * Runs over the live tree rather than the context, because publication has
+ * already moved the panes onto it and released the context's scratch index.
+ */
+static int
+restart_apply_deliver(char **cause)
+{
+	struct window_pane	*wp;
+	char			*one;
+	int			 failed = 0;
+
+	RB_FOREACH(wp, window_pane_tree, &all_window_panes) {
+		one = NULL;
+		if (window_pane_restart_enable_event(wp, &one) == 0)
+			continue;
+		if (!failed) {
+			failed = 1;
+			restart_set_cause(cause, "%s", one);
+		}
+		free(one);
+	}
+	return (failed ? -1 : 0);
+}
+
+static void
+restart_apply_publish(struct restart_apply_context *ctx,
+    const struct restart_state *state)
+{
+	struct window_pane	*wp;
+	size_t			 i;
+
+	for (i = 0; i < state->pane_count; i++) {
+		wp = ctx->panes_by_id[i];
+		if (wp == NULL || ctx->terminals[i] == NULL)
+			continue;
+		restart_terminal_commit(ctx->terminals[i], wp);
+		ctx->terminals[i] = NULL;
+	}
+
+	/*
+	 * Ownership moves rather than copies: the candidate roots are emptied
+	 * so nothing holds a second reference to an object the live roots now
+	 * own, and rollback can no longer reach any of it.
+	 */
+	sessions = ctx->sessions;
+	session_groups = ctx->groups;
+	windows = ctx->windows;
+	all_window_panes = ctx->panes;
+	RB_INIT(&ctx->sessions);
+	RB_INIT(&ctx->groups);
+	RB_INIT(&ctx->windows);
+	RB_INIT(&ctx->panes);
+
+	options_free(global_options);
+	options_free(global_s_options);
+	options_free(global_w_options);
+	environ_free(global_environ);
+	global_options = ctx->global_options;
+	global_s_options = ctx->global_s_options;
+	global_w_options = ctx->global_w_options;
+	global_environ = ctx->global_environ;
+	ctx->global_options = NULL;
+	ctx->global_s_options = NULL;
+	ctx->global_w_options = NULL;
+	ctx->global_environ = NULL;
+
+	utf8_restart_commit_width_cache(ctx->utf8_cache);
+	ctx->utf8_cache = NULL;
+
+	restart_buffers_publish(state);
+
+	next_session_id = ctx->next_session_id;
+	window_set_counters(ctx->next_window_id, ctx->next_pane_id,
+	    ctx->next_active_point);
+	hyperlinks_restart_set_next_external_id(
+	    ctx->next_hyperlink_external_id);
+	start_time = ctx->start_time;
+
+	restart_apply_release_scratch(ctx);
+	ctx->published = 1;
+}
+
+static int
+restart_apply_check_references(struct restart_apply_context *ctx,
+    const struct restart_state *state, char **cause)
+{
+	struct session		*sn;
+	struct window		*w;
+	struct window_pane	*wp;
+	struct winlink		*wl;
+	size_t			 nsessions = 0, nwindows = 0, npanes = 0;
+	u_int			 forward, reverse;
+
+	RB_FOREACH(sn, sessions, &ctx->sessions) {
+		nsessions++;
+		if (nsessions > state->session_count) {
+			restart_set_cause(cause,
+			    "restart candidate has more sessions than the "
+			    "decoded state");
+			return (-1);
+		}
+		if (sn->references != 1) {
+			restart_set_cause(cause,
+			    "restart session reference count is %u, not 1",
+			    sn->references);
+			return (-1);
+		}
+		if (sn->attached != 0) {
+			restart_set_cause(cause,
+			    "restart session has %u attached clients",
+			    sn->attached);
+			return (-1);
+		}
+		if (!RB_EMPTY(&sn->windows) && sn->curw == NULL) {
+			restart_set_cause(cause,
+			    "restart session has winlinks but no current");
+			return (-1);
+		}
+	}
+
+	RB_FOREACH(w, windows, &ctx->windows) {
+		nwindows++;
+		if (nwindows > state->window_count) {
+			restart_set_cause(cause,
+			    "restart candidate has more windows than the "
+			    "decoded state");
+			return (-1);
+		}
+
+		forward = 0;
+		RB_FOREACH(sn, sessions, &ctx->sessions) {
+			RB_FOREACH(wl, winlinks, &sn->windows) {
+				if (wl->window != w)
+					continue;
+				if (forward == UINT_MAX) {
+					restart_set_cause(cause,
+					    "restart window winlink count "
+					    "overflows");
+					return (-1);
+				}
+				forward++;
+			}
+		}
+		reverse = 0;
+		TAILQ_FOREACH(wl, &w->winlinks, wentry) {
+			if (wl->window != w) {
+				restart_set_cause(cause,
+				    "restart window reverse list holds a "
+				    "foreign winlink");
+				return (-1);
+			}
+			if (reverse == UINT_MAX) {
+				restart_set_cause(cause,
+				    "restart window reverse list overflows");
+				return (-1);
+			}
+			reverse++;
+		}
+		if (forward == 0) {
+			restart_set_cause(cause,
+			    "restart window has no winlink");
+			return (-1);
+		}
+		if (forward != reverse || w->references != forward) {
+			restart_set_cause(cause,
+			    "restart window references %u, forward %u, "
+			    "reverse %u", w->references, forward, reverse);
+			return (-1);
+		}
+		if (w->active == NULL || w->active->window != w) {
+			restart_set_cause(cause,
+			    "restart window has no owned active pane");
+			return (-1);
+		}
+		if (TAILQ_EMPTY(&w->panes)) {
+			restart_set_cause(cause, "restart window has no pane");
+			return (-1);
+		}
+	}
+
+	RB_FOREACH(wp, window_pane_tree, &ctx->panes) {
+		npanes++;
+		if (npanes > state->pane_count) {
+			restart_set_cause(cause,
+			    "restart candidate has more panes than the "
+			    "decoded state");
+			return (-1);
+		}
+		if (wp->references != 1) {
+			restart_set_cause(cause,
+			    "restart pane reference count is %d, not 1",
+			    wp->references);
+			return (-1);
+		}
+		if (wp->window == NULL ||
+		    RB_FIND(windows, &ctx->windows, wp->window) != wp->window) {
+			restart_set_cause(cause,
+			    "restart pane is not owned by a candidate window");
+			return (-1);
+		}
+		if (!TAILQ_EMPTY(&wp->modes) || wp->wait_item != NULL ||
+		    wp->editor != NULL) {
+			restart_set_cause(cause,
+			    "restart pane carries a mode, wait or editor "
+			    "owner");
+			return (-1);
+		}
+	}
+
+	/*
+	 * Lifecycle-7 finalization removes objects, so the candidate is the
+	 * decoded set minus what the cascade took. Comparing against the
+	 * decoded counts alone would reject every graph containing an exited
+	 * pane with remain-on-exit off.
+	 */
+	if (nsessions != state->session_count -
+	    restart_apply_removed_count(ctx->removed_sessions,
+	    state->session_count) ||
+	    nwindows != state->window_count -
+	    restart_apply_removed_count(ctx->removed_windows,
+	    state->window_count) ||
+	    npanes != state->pane_count -
+	    restart_apply_removed_count(ctx->removed_panes,
+	    state->pane_count)) {
+		restart_set_cause(cause,
+		    "restart candidate root counts do not match the decoded "
+		    "state");
+		return (-1);
+	}
+	return (0);
+}
+
+int
+restart_state_apply(const struct restart_state *state,
+    restart_fd_lookup_cb lookup, void *arg, char **cause)
+{
+	struct restart_apply_context	 ctx;
+
+	if (cause != NULL)
+		*cause = NULL;
+	if (state == NULL) {
+		restart_set_cause(cause, "restart apply needs decoded state");
+		return (-1);
+	}
+	if (lookup == NULL && state->descriptor_count != 0) {
+		restart_set_cause(cause,
+		    "restart apply needs a descriptor callback");
+		return (-1);
+	}
+	if (restart_apply_roots_empty(cause) != 0)
+		return (-1);
+
+	restart_apply_init(&ctx);
+
+	/*
+	 * Revalidates the decoded state, so a caller inside the tree cannot
+	 * apply a partially constructed or mutated private DTO.
+	 */
+	if (restart_state_validate(state, &ctx.budget, cause) != 0)
+		goto fail;
+	if (restart_apply_meta(&ctx, state, cause) != 0)
+		goto fail;
+	if (restart_apply_globals(&ctx, state, cause) != 0)
+		goto fail;
+	if (restart_apply_indexes(&ctx, state, cause) != 0)
+		goto fail;
+	if (restart_apply_windows(&ctx, state, cause) != 0)
+		goto fail;
+	if (restart_apply_panes(&ctx, state, cause) != 0)
+		goto fail;
+	if (restart_apply_link(&ctx, state, cause) != 0)
+		goto fail;
+	if (restart_apply_layouts(&ctx, state, cause) != 0)
+		goto fail;
+	if (restart_apply_sessions(&ctx, state, cause) != 0)
+		goto fail;
+	if (restart_apply_link_sessions(&ctx, state, cause) != 0)
+		goto fail;
+	if (restart_apply_lifecycles(&ctx, state, cause) != 0)
+		goto fail;
+	if (restart_apply_descriptors(&ctx, state, lookup, arg, cause) != 0)
+		goto fail;
+	/*
+	 * First reference pass, over the fully built graph before any cascade
+	 * removes from it. Running it only after finalization would let a
+	 * defect in construction be reported as a defect in the cascade, and
+	 * would let a cascade that happened to restore the equations hide one
+	 * that construction had already broken.
+	 */
+	if (restart_apply_check_references(&ctx, state, cause) != 0)
+		goto fail;
+	if (restart_apply_lifecycles_final(&ctx, state, cause) != 0)
+		goto fail;
+	if (restart_apply_derive(&ctx, cause) != 0)
+		goto fail;
+	restart_apply_geometry(&ctx);
+	if (restart_apply_prepare_terminals(&ctx, state, cause) != 0)
+		goto fail;
+	if (restart_apply_preflight(&ctx, state, cause) != 0)
+		goto fail;
+	if (restart_apply_check_references(&ctx, state, cause) != 0)
+		goto fail;
+
+	restart_apply_publish(&ctx, state);
+
+	/*
+	 * Delivery runs after publication because it touches the children,
+	 * which is the one thing that cannot be undone. There is no rollback
+	 * past this point, so a pane that will not take its resize is
+	 * reported rather than retried, and the loop continues: aborting on
+	 * the first would leave every later pane holding a staged resize its
+	 * child never hears about, which is worse than the failure being
+	 * reported.
+	 */
+	return (restart_apply_deliver(cause));
+
+fail:
+	restart_apply_rollback(&ctx);
+	return (-1);
 }

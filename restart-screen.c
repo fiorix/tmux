@@ -829,6 +829,64 @@ restart_utf8_capture(const struct utf8_data *from, struct restart_utf8 *to)
 	memcpy(to->data, from->data, from->have);
 }
 
+/* Check a parser state is one that arms the ground timer. */
+int
+restart_parser_timer_state(const char *state)
+{
+	return (strncmp(state, "dcs_", 4) == 0 ||
+	    strcmp(state, "osc_string") == 0 ||
+	    strcmp(state, "apc_string") == 0 ||
+	    strcmp(state, "rename_string") == 0 ||
+	    strcmp(state, "consume_st") == 0);
+}
+
+/* Build a live parser state from a decoded one. */
+int
+restart_parser_build(const struct restart_parser *in,
+    struct input_parser_state *out, char **cause)
+{
+	memset(out, 0, sizeof *out);
+	out->state = in->state;
+	if (restart_cell_build(&in->cell.cell, &out->cell.cell, cause) != 0 ||
+	    restart_cell_build(&in->old_cell.cell, &out->old_cell.cell,
+	    cause) != 0)
+		return (-1);
+	out->cell.set = in->cell.set;
+	out->cell.g0set = in->cell.g0set;
+	out->cell.g1set = in->cell.g1set;
+	out->old_cell.set = in->old_cell.set;
+	out->old_cell.g0set = in->old_cell.g0set;
+	out->old_cell.g1set = in->old_cell.g1set;
+	out->old_cx = in->old_cx;
+	out->old_cy = in->old_cy;
+	out->old_mode = in->old_mode;
+
+	if (in->intermediate.size != 0) {
+		memcpy(out->interm_buf, in->intermediate.data,
+		    in->intermediate.size);
+	}
+	out->interm_len = in->intermediate.size;
+	if (in->parameter.size != 0)
+		memcpy(out->param_buf, in->parameter.data, in->parameter.size);
+	out->param_len = in->parameter.size;
+	out->input_buf = in->input.data;
+	out->input_len = in->input.size;
+	out->input_end = in->input_end;
+
+	out->utf8data.have = in->utf8.have;
+	out->utf8data.size = in->utf8.size;
+	out->utf8data.width = in->utf8.width;
+	memcpy(out->utf8data.data, in->utf8.data, in->utf8.have);
+	out->utf8started = in->utf8_started;
+	out->last.have = in->last_utf8.have;
+	out->last.size = in->last_utf8.size;
+	out->last.width = in->last_utf8.width;
+	memcpy(out->last.data, in->last_utf8.data, in->last_utf8.have);
+
+	out->flags = in->flags;
+	return (0);
+}
+
 /* Capture a pane's parser. */
 static int
 restart_parser_capture(const struct input_ctx *ictx,

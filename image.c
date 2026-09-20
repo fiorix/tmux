@@ -37,6 +37,62 @@ image_limit(void)
 	return (MAX_IMAGE_COUNT - 1);
 }
 
+/*
+ * Check whether count more images can be held. image_store evicts on reaching
+ * the limit, so the most that can be present at once is one fewer than it.
+ */
+int
+image_restart_room(size_t count)
+{
+	if (all_images_count > image_limit() ||
+	    count > image_limit() - all_images_count)
+		return (-1);
+	return (0);
+}
+
+/*
+ * Free a list of images that is not attached to a screen. Used to discard a
+ * candidate that was built but will not be published.
+ */
+void
+image_restart_discard(struct images *images)
+{
+	struct image	*im;
+
+	while ((im = TAILQ_FIRST(images)) != NULL) {
+		TAILQ_REMOVE(images, im, entry);
+		sixel_free(im->data);
+		free(im->fallback);
+		free(im);
+	}
+}
+
+/*
+ * Attach a prepared list to a screen and enter every image in the global
+ * list. The head is repaired by hand because a list moved with TAILQ_CONCAT
+ * still points back at the head it came from.
+ */
+void
+image_restart_commit(struct screen *s, struct images *images, int saved)
+{
+	struct images	*target = saved ? &s->saved_images : &s->images;
+	struct image	*im;
+
+	if (target != images)
+		TAILQ_CONCAT(target, images, entry);
+	if (TAILQ_EMPTY(target)) {
+		TAILQ_INIT(target);
+		return;
+	}
+	TAILQ_FIRST(target)->entry.tqe_prev = &target->tqh_first;
+	TAILQ_FOREACH(im, target, entry) {
+		im->s = s;
+		im->list = target;
+		TAILQ_INSERT_TAIL(&all_images, im, all_entry);
+		all_images_count++;
+	}
+}
+
 static void printflike(3, 4)
 image_log(struct image *im, const char* from, const char* fmt, ...)
 {

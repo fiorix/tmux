@@ -3772,3 +3772,129 @@ input_report_current_theme(struct input_ctx *ictx)
 		}
 	}
 }
+
+/* Look a parser state up by the name it was saved under. */
+static const struct input_state *
+input_restart_state(const char *name)
+{
+	const struct input_state *states[] = {
+		&input_state_ground,
+		&input_state_esc_enter,
+		&input_state_esc_intermediate,
+		&input_state_csi_enter,
+		&input_state_csi_parameter,
+		&input_state_csi_intermediate,
+		&input_state_csi_ignore,
+		&input_state_dcs_enter,
+		&input_state_dcs_parameter,
+		&input_state_dcs_intermediate,
+		&input_state_dcs_handler,
+		&input_state_dcs_escape,
+		&input_state_dcs_ignore,
+		&input_state_osc_string,
+		&input_state_apc_string,
+		&input_state_rename_string,
+		&input_state_consume_st
+	};
+	size_t i;
+
+	for (i = 0; i < nitems(states); i++) {
+		if (strcmp(states[i]->name, name) == 0)
+			return (states[i]);
+	}
+	return (NULL);
+}
+
+/* Build a parser from saved state. */
+int
+input_restore(const struct input_parser_state *ips, struct input_ctx **out,
+    char **cause)
+{
+	const struct input_state	*state;
+	struct input_ctx		*ictx;
+	size_t				 input_space;
+
+	*out = NULL;
+	state = input_restart_state(ips->state);
+	if (state == NULL) {
+		xasprintf(cause, "unknown input state");
+		return (-1);
+	}
+	input_space = ips->input_len + 1;
+	if (input_space < INPUT_BUF_START)
+		input_space = INPUT_BUF_START;
+
+	ictx = xcalloc(1, sizeof *ictx);
+	ictx->input_space = input_space;
+	evtimer_set(&ictx->ground_timer, input_ground_timer_callback, ictx);
+	TAILQ_INIT(&ictx->requests);
+	evtimer_set(&ictx->request_timer, input_request_timer_callback, ictx);
+	ictx->input_buf = xmalloc(ictx->input_space);
+	ictx->since_ground = evbuffer_new();
+	if (ictx->since_ground == NULL)
+		fatalx("out of memory");
+
+	if (ips->input_len != 0)
+		memcpy(ictx->input_buf, ips->input_buf, ips->input_len);
+	ictx->input_len = ips->input_len;
+	ictx->input_buf[ictx->input_len] = '\0';
+
+	memcpy(ictx->interm_buf, ips->interm_buf, sizeof ictx->interm_buf);
+	ictx->interm_len = ips->interm_len;
+	memcpy(ictx->param_buf, ips->param_buf, sizeof ictx->param_buf);
+	ictx->param_len = ips->param_len;
+
+	memcpy(&ictx->cell, &ips->cell, sizeof ictx->cell);
+	memcpy(&ictx->old_cell, &ips->old_cell, sizeof ictx->old_cell);
+	ictx->old_cx = ips->old_cx;
+	ictx->old_cy = ips->old_cy;
+	ictx->old_mode = ips->old_mode;
+	ictx->input_end = ips->input_end;
+
+	memcpy(&ictx->utf8data, &ips->utf8data, sizeof ictx->utf8data);
+	ictx->utf8started = ips->utf8started;
+	memcpy(&ictx->last, &ips->last, sizeof ictx->last);
+
+	ictx->flags = ips->flags;
+	ictx->state = state;
+
+	*out = ictx;
+	return (0);
+}
+
+/* Restart the ground timer, which a restored parser is not left holding. */
+int
+input_restart_arm_ground_timer(struct input_ctx *ictx, char **cause)
+{
+	struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+
+	if (evtimer_add(&ictx->ground_timer, &tv) != 0) {
+		xasprintf(cause, "could not arm input timer");
+		return (-1);
+	}
+	return (0);
+}
+
+/* Point a restored parser at the pane, event and palette it belongs to. */
+void
+input_restart_bind(struct input_ctx *ictx, struct window_pane *wp,
+    struct bufferevent *event, struct colour_palette *palette)
+{
+	ictx->wp = wp;
+	ictx->event = event;
+	ictx->palette = palette;
+}
+
+/* Free a parser that was built but will not be attached to a pane. */
+void
+input_restart_discard(struct input_ctx *ictx)
+{
+	if (ictx == NULL)
+		return;
+	event_del(&ictx->request_timer);
+	event_del(&ictx->ground_timer);
+	free(ictx->input_buf);
+	if (ictx->since_ground != NULL)
+		evbuffer_free(ictx->since_ground);
+	free(ictx);
+}
