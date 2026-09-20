@@ -2665,16 +2665,16 @@ struct key_binding	**sort_get_key_bindings_table(struct key_table *,
 #define FORMAT_NOJOBS 0x4
 #define FORMAT_VERBOSE 0x8
 #define FORMAT_LAST 0x10
-#define FORMAT_NONE 0
-#define FORMAT_PANE 0x80000000U
-#define FORMAT_WINDOW 0x40000000U
+#define FORMAT_NONE 0ULL
+#define FORMAT_WINDOW 0x100000000ULL
+#define FORMAT_PANE 0x200000000ULL
 struct format_tree;
 struct format_modifier;
 typedef void *(*format_cb)(struct format_tree *);
 void		 format_tidy_jobs(void);
 const char	*format_skip(const char *, const char *);
 int		 format_true(const char *);
-struct format_tree *format_create(struct client *, struct cmdq_item *, int,
+struct format_tree *format_create(struct client *, struct cmdq_item *, uint64_t,
 		     int);
 void		 format_free(struct format_tree *);
 void		 format_merge(struct format_tree *, struct format_tree *);
