@@ -75,14 +75,14 @@ options_array_correct_key(const char *key)
 	return (xstrdup(key));
 }
 
-static int
-options_array_cmp(struct options_array_item *a1, struct options_array_item *a2)
+int
+options_array_key_cmp(const char *key1, const char *key2)
 {
 	u_int	i1, i2;
 	int	n1, n2;
 
-	n1 = options_array_key_to_number(a1->key, &i1);
-	n2 = options_array_key_to_number(a2->key, &i2);
+	n1 = options_array_key_to_number(key1, &i1);
+	n2 = options_array_key_to_number(key2, &i2);
 	if (n1 && n2) {
 		if (i1 < i2)
 			return (-1);
@@ -94,7 +94,13 @@ options_array_cmp(struct options_array_item *a1, struct options_array_item *a2)
 		return (-1);
 	if (n2)
 		return (1);
-	return (strcmp(a1->key, a2->key));
+	return (strcmp(key1, key2));
+}
+
+static int
+options_array_cmp(struct options_array_item *a1, struct options_array_item *a2)
+{
+	return (options_array_key_cmp(a1->key, a2->key));
 }
 RB_GENERATE_STATIC(options_array, options_array_item, entry, options_array_cmp);
 
@@ -702,6 +708,12 @@ union options_value *
 options_array_item_value(struct options_array_item *a)
 {
 	return (&a->value);
+}
+
+union options_value *
+options_entry_value(struct options_entry *o)
+{
+	return (&o->value);
 }
 
 int

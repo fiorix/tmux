@@ -27,11 +27,21 @@ struct ibuf;
 struct window_pane;
 
 struct restart_terminal;
+struct restart_state;
 
 int restart_terminal_encode(const struct window_pane *, struct ibuf **,
     char **);
 int restart_terminal_decode(const void *, size_t, struct restart_terminal **,
     char **);
 void restart_terminal_free(struct restart_terminal *);
+
+int restart_state_encode(struct ibuf **, char **);
+int restart_state_decode(const void *, size_t, struct restart_state **,
+    char **);
+uint64_t restart_state_features(const struct restart_state *);
+size_t restart_state_descriptor_count(const struct restart_state *);
+int restart_state_descriptor_at(const struct restart_state *, size_t,
+    u_int *, pid_t *);
+void restart_state_free(struct restart_state *);
 
 #endif

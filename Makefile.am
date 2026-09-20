@@ -200,6 +200,8 @@ dist_tmux_SOURCES = \
 	restart-codec.c \
 	restart-codec.h \
 	restart-screen.c \
+	restart-state-private.h \
+	restart-state.c \
 	screen-redraw.c \
 	screen-write.c \
 	screen.c \

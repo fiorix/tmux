@@ -2665,6 +2665,7 @@ void	cfg_show_causes(struct session *);
 /* paste.c */
 const char	*paste_buffer_name(struct paste_buffer *);
 u_int		 paste_buffer_order(struct paste_buffer *);
+int		 paste_buffer_automatic(struct paste_buffer *);
 time_t		 paste_buffer_created(struct paste_buffer *);
 const char	*paste_buffer_data(struct paste_buffer *, size_t *);
 struct paste_buffer *paste_walk(struct paste_buffer *);
@@ -2866,7 +2867,9 @@ int		 options_array_assign(struct options_entry *, const char *,
 struct options_array_item *options_array_first(struct options_entry *);
 struct options_array_item *options_array_next(struct options_array_item *);
 const char	*options_array_item_key(struct options_array_item *);
+int		 options_array_key_cmp(const char *, const char *);
 union options_value *options_array_item_value(struct options_array_item *);
+union options_value *options_entry_value(struct options_entry *);
 int		 options_is_array(struct options_entry *);
 int		 options_is_string(struct options_entry *);
 char		*options_to_string(struct options_entry *, const char *, int);
@@ -3745,6 +3748,7 @@ struct window	*window_find_by_id_str(const char *);
 struct window	*window_find_by_id(u_int);
 void		 window_update_activity(struct window *);
 struct window	*window_create(u_int, u_int, u_int, u_int);
+void		 window_get_counters(u_int *, u_int *, u_int *);
 void		 window_pane_set_event(struct window_pane *);
 void		 window_pane_wait_finish(struct window_pane *);
 struct window_pane *window_get_active_at(struct window *, u_int, u_int);
@@ -4299,6 +4303,7 @@ u_int			 hyperlinks_entry(struct hyperlinks_uri *,
 			     const char **, const char **, const char **);
 u_int			 hyperlinks_next_inner(struct hyperlinks *);
 u_int			 hyperlinks_limit(void);
+long long		 hyperlinks_get_next_external_id(void);
 struct hyperlinks	*hyperlinks_init(void);
 struct hyperlinks	*hyperlinks_copy(struct hyperlinks *);
 void			 hyperlinks_reset(struct hyperlinks *);

@@ -83,6 +83,13 @@ paste_buffer_order(struct paste_buffer *pb)
 	return (pb->order);
 }
 
+/* Get paste buffer automatic flag. */
+int
+paste_buffer_automatic(struct paste_buffer *pb)
+{
+	return (pb->automatic);
+}
+
 /* Get paste buffer created. */
 time_t
 paste_buffer_created(struct paste_buffer *pb)

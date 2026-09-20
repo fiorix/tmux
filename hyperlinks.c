@@ -241,6 +241,13 @@ hyperlinks_next_inner(struct hyperlinks *hl)
 	return (hl->next_inner);
 }
 
+/* Get the number the next hyperlink's external ID will use. */
+long long
+hyperlinks_get_next_external_id(void)
+{
+	return (hyperlinks_next_external_id);
+}
+
 /*
  * Get the most hyperlinks that can be held. hyperlinks_put evicts on reaching
  * the limit, so one fewer than it can be present at once.
