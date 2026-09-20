@@ -51,12 +51,6 @@
  *   be passed to the underlying terminals.
  */
 
-/* Type of terminator. */
-enum input_end_type {
-	INPUT_END_ST,
-	INPUT_END_BEL
-};
-
 /* Request sent by a pane. */
 struct input_request {
 	struct client			*c;
@@ -73,14 +67,6 @@ struct input_request {
 	TAILQ_ENTRY(input_request)	 centry;
 };
 #define INPUT_REQUEST_TIMEOUT 500
-
-/* Input parser cell. */
-struct input_cell {
-	struct grid_cell	cell;
-	int			set;
-	int			g0set;	/* 1 if ACS */
-	int			g1set;	/* 1 if ACS */
-};
 
 /* Input parser argument. */
 struct input_param {
@@ -3506,6 +3492,57 @@ input_set_buffer_size(size_t buffer_size)
 {
 	log_debug("%s: %lu -> %lu", __func__, input_buffer_size, buffer_size);
 	input_buffer_size = buffer_size;
+}
+
+/* Get input buffer size. */
+size_t
+input_get_buffer_size(void)
+{
+	return (input_buffer_size);
+}
+
+/* Save parser state. */
+void
+input_save_parser(const struct input_ctx *ictx, struct input_parser_state *ips)
+{
+	memset(ips, 0, sizeof *ips);
+
+	ips->state = ictx->state->name;
+
+	memcpy(&ips->cell, &ictx->cell, sizeof ips->cell);
+	memcpy(&ips->old_cell, &ictx->old_cell, sizeof ips->old_cell);
+	ips->old_cx = ictx->old_cx;
+	ips->old_cy = ictx->old_cy;
+	ips->old_mode = ictx->old_mode;
+
+	memcpy(ips->interm_buf, ictx->interm_buf, sizeof ips->interm_buf);
+	ips->interm_len = ictx->interm_len;
+
+	memcpy(ips->param_buf, ictx->param_buf, sizeof ips->param_buf);
+	ips->param_len = ictx->param_len;
+
+	if (ictx->input_len != 0) {
+		ips->input_buf = xmalloc(ictx->input_len);
+		memcpy(ips->input_buf, ictx->input_buf, ictx->input_len);
+	}
+	ips->input_len = ictx->input_len;
+	ips->input_end = ictx->input_end;
+
+	if (ictx->utf8started)
+		memcpy(&ips->utf8data, &ictx->utf8data, sizeof ips->utf8data);
+	ips->utf8started = ictx->utf8started;
+	memcpy(&ips->last, &ictx->last, sizeof ips->last);
+
+	ips->flags = ictx->flags;
+}
+
+/* Free saved parser state. */
+void
+input_free_parser_state(struct input_parser_state *ips)
+{
+	free(ips->input_buf);
+	ips->input_buf = NULL;
+	ips->input_len = 0;
 }
 
 /* Request timer. Remove any requests that are too old. */

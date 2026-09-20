@@ -209,6 +209,48 @@ hyperlinks_get(struct hyperlinks *hl, u_int inner, const char **uri_out,
 	return (1);
 }
 
+/* Get first hyperlink. */
+struct hyperlinks_uri *
+hyperlinks_first(struct hyperlinks *hl)
+{
+	return (RB_MIN(hyperlinks_by_inner_tree, &hl->by_inner));
+}
+
+/* Get next hyperlink. */
+struct hyperlinks_uri *
+hyperlinks_next(struct hyperlinks_uri *hlu)
+{
+	return (RB_NEXT(hyperlinks_by_inner_tree, &hlu->tree->by_inner, hlu));
+}
+
+/* Get hyperlink contents. */
+u_int
+hyperlinks_entry(struct hyperlinks_uri *hlu, const char **uri_out,
+    const char **internal_id_out, const char **external_id_out)
+{
+	*uri_out = hlu->uri;
+	*internal_id_out = hlu->internal_id;
+	*external_id_out = hlu->external_id;
+	return (hlu->inner);
+}
+
+/* Get number the next hyperlink will be given. */
+u_int
+hyperlinks_next_inner(struct hyperlinks *hl)
+{
+	return (hl->next_inner);
+}
+
+/*
+ * Get the most hyperlinks that can be held. hyperlinks_put evicts on reaching
+ * the limit, so one fewer than it can be present at once.
+ */
+u_int
+hyperlinks_limit(void)
+{
+	return (MAX_HYPERLINKS - 1);
+}
+
 /* Initialize hyperlink set. */
 struct hyperlinks *
 hyperlinks_init(void)

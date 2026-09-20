@@ -290,14 +290,15 @@ sixel_parse_repeat(struct sixel_image *si, const char *cp, const char *end)
 	return (last);
 }
 
-struct sixel_image *
-sixel_parse(const char *buf, size_t len, u_int p2, u_int xpixel, u_int ypixel)
+static struct sixel_image *
+sixel_parse1(const char *buf, size_t len, u_int p2, u_int xpixel, u_int ypixel,
+    int restart)
 {
 	struct sixel_image	*si;
 	const char		*cp = buf, *end = buf + len;
 	char			 ch;
 
-	if (len == 0 || len == 1 || *cp++ != 'q') {
+	if (len == 0 || (len == 1 && !restart) || *cp++ != 'q') {
 		log_debug("%s: empty image", __func__);
 		return (NULL);
 	}
@@ -346,13 +347,19 @@ sixel_parse(const char *buf, size_t len, u_int p2, u_int xpixel, u_int ypixel)
 		}
 	}
 
-	if (si->x == 0 || si->y == 0)
+	if (!restart && (si->x == 0 || si->y == 0))
 		goto bad;
 	return (si);
 
 bad:
 	sixel_free(si);
 	return (NULL);
+}
+
+struct sixel_image *
+sixel_parse(const char *buf, size_t len, u_int p2, u_int xpixel, u_int ypixel)
+{
+	return (sixel_parse1(buf, len, p2, xpixel, ypixel, 0));
 }
 
 void
@@ -405,6 +412,20 @@ sixel_size_in_cells(struct sixel_image *si, u_int *x, u_int *y)
 		*y = (si->y / si->ypixel);
 	else
 		*y = 1 + (si->y / si->ypixel);
+}
+
+void
+sixel_size_in_pixels(struct sixel_image *si, u_int *x, u_int *y)
+{
+	*x = si->x;
+	*y = si->y;
+}
+
+void
+sixel_cell_size(struct sixel_image *si, u_int *xpixel, u_int *ypixel)
+{
+	*xpixel = si->xpixel;
+	*ypixel = si->ypixel;
 }
 
 struct sixel_image *
@@ -562,14 +583,15 @@ sixel_print_compress_colors(struct sixel_image *si, struct sixel_chunk *chunks,
 	}
 }
 
-char *
-sixel_print(struct sixel_image *si, struct sixel_image *map, size_t *size)
+static char *
+sixel_print1(struct sixel_image *si, struct sixel_image *map, size_t *size,
+    int restart)
 {
 	char			*buf, tmp[64];
 	size_t			 len, used = 0, tmplen;
 	u_int			*colours, ncolours, used_colours, i, c, y;
-	u_int			*active, nactive;
-	struct sixel_chunk	*chunks, *chunk;
+	u_int			*active = NULL, nactive, high = 0;
+	struct sixel_chunk	*chunks = NULL, *chunk;
 
 	if (map != NULL) {
 		colours = map->colours;
@@ -580,7 +602,7 @@ sixel_print(struct sixel_image *si, struct sixel_image *map, size_t *size)
 	}
 
 	used_colours = si->used_colours;
-	if (used_colours == 0)
+	if (used_colours == 0 && !restart)
 		return (NULL);
 
 	len = 8192;
@@ -595,14 +617,20 @@ sixel_print(struct sixel_image *si, struct sixel_image *map, size_t *size)
 		sixel_print_add(&buf, &len, &used, tmp, tmplen);
 	}
 
+	if (used_colours == 0)
+		goto done;
+
 	chunks = xcalloc(used_colours, sizeof *chunks);
 	active = xcalloc(used_colours, sizeof *active);
 
 	for (i = 0; i < ncolours; i++) {
 		c = colours[i];
+		if (restart && (c >> 25) == 0)
+			continue;
 		tmplen = xsnprintf(tmp, sizeof tmp, "#%u;%u;%u;%u;%u",
 		    i, c >> 25, (c >> 16) & 0x1ff, (c >> 8) & 0xff, c & 0xff);
 		sixel_print_add(&buf, &len, &used, tmp, tmplen);
+		high = i + 1;
 	}
 
 	for (i = 0; i < used_colours; i++) {
@@ -635,18 +663,92 @@ sixel_print(struct sixel_image *si, struct sixel_image *map, size_t *size)
 	if (buf[used - 1] == '-')
 		used--;
 
+done:
+	if (restart && high < used_colours) {
+		tmplen = xsnprintf(tmp, sizeof tmp, "#%u", used_colours - 1);
+		sixel_print_add(&buf, &len, &used, tmp, tmplen);
+	}
+
 	sixel_print_add(&buf, &len, &used, "\033\\", 2);
 
 	buf[used] = '\0';
 	if (size != NULL)
 		*size = used;
 
-	for (i = 0; i < used_colours; i++)
-		free(chunks[i].data);
+	if (chunks != NULL) {
+		for (i = 0; i < used_colours; i++)
+			free(chunks[i].data);
+	}
 	free(active);
 	free(chunks);
 
 	return (buf);
+}
+
+char *
+sixel_print(struct sixel_image *si, struct sixel_image *map, size_t *size)
+{
+	return (sixel_print1(si, map, size, 0));
+}
+
+/*
+ * Print in a canonical form, which unlike sixel_print is stable under print,
+ * parse, print, so a saved image can be checked against what it came from.
+ */
+char *
+sixel_restart_print(struct sixel_image *si, size_t *size)
+{
+	return (sixel_print1(si, NULL, size, 1));
+}
+
+/* Parse an image, rejecting anything that does not print back the same. */
+struct sixel_image *
+sixel_restart_parse(const void *data, size_t size, u_int xpixel, u_int ypixel,
+    u_int x, u_int y)
+{
+	const u_char		*bytes = data;
+	struct sixel_image	*si;
+	char			*printed;
+	size_t			 i, printed_size;
+	uint64_t		 p2 = 0;
+
+	if (size < 8 || xpixel == 0 || ypixel == 0 || x == 0 || y == 0 ||
+	    x > SIXEL_WIDTH_LIMIT || y > SIXEL_HEIGHT_LIMIT ||
+	    bytes[0] != '\033' || bytes[1] != 'P' || bytes[2] != '9' ||
+	    bytes[3] != ';' || bytes[size - 2] != '\033' ||
+	    bytes[size - 1] != '\\')
+		return (NULL);
+
+	i = 4;
+	if (bytes[i] < '0' || bytes[i] > '9')
+		return (NULL);
+	while (i < size - 2 && bytes[i] >= '0' && bytes[i] <= '9') {
+		p2 = p2 * 10 + bytes[i++] - '0';
+		if (p2 > UINT_MAX)
+			return (NULL);
+	}
+	if (i >= size - 2 || bytes[i] != 'q')
+		return (NULL);
+
+	si = sixel_parse1((const char *)bytes + i, size - i - 2, p2, xpixel,
+	    ypixel, 1);
+	if (si == NULL)
+		return (NULL);
+	if (x < si->x || y < si->y || sixel_parse_expand_lines(si, y) != 0) {
+		sixel_free(si);
+		return (NULL);
+	}
+	si->x = x;
+
+	printed = sixel_print1(si, NULL, &printed_size, 1);
+	if (printed == NULL || printed_size != size ||
+	    memcmp(printed, data, size) != 0) {
+		free(printed);
+		sixel_free(si);
+		return (NULL);
+	}
+	free(printed);
+	return (si);
 }
 
 struct screen *
