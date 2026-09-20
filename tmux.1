@@ -1592,6 +1592,23 @@ option.
 .D1 Pq alias: Ic rename
 Rename the session to
 .Ar new\-name .
+.It Ic restart\-server
+Replace the
+.Nm
+server with a new copy of its own image, keeping the sessions, windows and
+panes.
+The programs running in the panes are not restarted and keep their process
+identifiers.
+Clients are detached and must attach again.
+.Pp
+Some state is discarded:
+.Ic pipe\-pane
+output stops,
+panes in copy mode return to their normal view and forget any search,
+and prompts inside panes are cancelled.
+.Pp
+Options keep the values they had, including those never set explicitly, so a
+default changed by a newer version does not take effect after a restart.
 .It Xo Ic server\-access
 .Op Fl adglrw
 .Op Ar user | group
