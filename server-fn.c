@@ -532,6 +532,9 @@ server_check_unattached(void)
 	struct session		*s;
 	struct session_group	*sg;
 
+	if (server_restart_is_committed())
+		return;
+
 	/*
 	 * If any sessions are no longer attached and have destroy-unattached
 	 * set, collect them.

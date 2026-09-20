@@ -66,6 +66,8 @@ struct tmuxpeer {
 	int		 flags;
 #define PEER_BAD 0x1
 
+	int		 read_disabled;
+
 	void		(*dispatchcb)(struct imsg *, void *);
 	void		 *arg;
 
@@ -154,11 +156,32 @@ proc_update_event(struct tmuxpeer *peer)
 	event_del(&peer->event);
 
 	events = EV_READ;
+	if (peer->read_disabled)
+		events = 0;
 	if (imsgbuf_queuelen(&peer->ibuf) > 0)
 		events |= EV_WRITE;
+	if (events == 0)
+		return;
 	event_set(&peer->event, peer->ibuf.fd, events, proc_event_cb, peer);
 
 	event_add(&peer->event, NULL);
+}
+
+/* Get whether this peer is being read from. */
+int
+proc_peer_read_enabled(const struct tmuxpeer *peer)
+{
+	return (!peer->read_disabled);
+}
+
+/* Stop or resume reading from this peer. */
+void
+proc_set_peer_read(struct tmuxpeer *peer, int enabled)
+{
+	if (!peer->read_disabled == !enabled)
+		return;
+	peer->read_disabled = !enabled;
+	proc_update_event(peer);
 }
 
 int

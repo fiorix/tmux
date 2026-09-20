@@ -101,11 +101,4 @@ int	 restart_checkpoint_create(char **);
 int	 restart_checkpoint_seal(int, const struct ibuf *, char **);
 int	 restart_checkpoint_read(int, void **, size_t *, char **);
 
-int	 restart_exec_activated(void);
-int	 restart_exec_create_socket(uint64_t, struct restart_activation **,
-	     char **);
-void	 restart_exec_activation_free(struct restart_activation *);
-void	 restart_exec_fallback(struct restart_activation *);
-void	 restart_exec_finish(void);
-
 #endif
