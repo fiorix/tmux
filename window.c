@@ -406,6 +406,14 @@ window_update_activity(struct window *w)
 	alerts_queue(w, WINDOW_ACTIVITY);
 }
 
+void
+window_get_counters(u_int *window_id, u_int *pane_id, u_int *active_point)
+{
+	*window_id = next_window_id;
+	*pane_id = next_window_pane_id;
+	*active_point = next_active_point;
+}
+
 struct window *
 window_create(u_int sx, u_int sy, u_int xpixel, u_int ypixel)
 {
