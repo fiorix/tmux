@@ -197,6 +197,8 @@ dist_tmux_SOURCES = \
 	regsub.c \
 	resize.c \
 	restart-apply.c \
+	restart-exec.c \
+	restart-exec.h \
 	restart-codec-private.h \
 	restart-codec.c \
 	restart-codec.h \

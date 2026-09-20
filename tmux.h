@@ -2613,6 +2613,7 @@ extern struct options	*global_w_options;
 extern struct environ	*global_environ;
 extern struct timeval	 start_time;
 extern const char	*socket_path;
+extern const char	*tmux_path;
 extern const char	*shell_command;
 extern int		 ptm_fd;
 extern const char	*shell_command;
