@@ -645,6 +645,26 @@ spawn_get_editor_pid(struct spawn_editor_state *es)
 	return (es->pid);
 }
 
+/*
+ * Abandon an in-progress edit without reading its file or touching the pane
+ * beyond clearing the pointer. The editor process is not signalled: its
+ * descriptor is being handed to the replacement, so the process outlives this
+ * one and killing it here would destroy what the restart is preserving.
+ */
+void
+spawn_editor_discard(struct window_pane *wp)
+{
+	struct spawn_editor_state	*es = wp->editor;
+
+	if (es == NULL)
+		return;
+	wp->editor = NULL;
+
+	if (es->cb != NULL)
+		es->cb(NULL, 0, es->arg);
+	spawn_editor_free(es);
+}
+
 void
 spawn_editor_finish(struct window_pane *wp)
 {

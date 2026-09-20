@@ -1475,6 +1475,26 @@ window_pane_wait_finish(struct window_pane *wp)
 	cmdq_continue(item);
 }
 
+void
+window_pane_wait_cancel(struct window_pane *wp)
+{
+	struct cmdq_item	*item = wp->wait_item;
+	struct client		*c;
+
+	if (item == NULL)
+		return;
+	wp->wait_item = NULL;
+
+	c = cmdq_get_client(item);
+	if (c != NULL && c->session == NULL) {
+		c->retval = 1;
+		c->exit_type = CLIENT_EXIT_RETURN;
+		free(c->exit_message);
+		c->exit_message = xstrdup("server restarted while waiting");
+	}
+	cmdq_continue(item);
+}
+
 static void
 window_pane_free_modes(struct window_pane *wp)
 {

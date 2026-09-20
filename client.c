@@ -286,7 +286,14 @@ client_main(struct event_base *base, int argc, char **argv, uint64_t flags,
 		fd = server_start(client_proc, flags, base, -1, NULL);
 	} else
 #endif
-	fd = client_connect(base, socket_path, client_flags);
+	if (restart_exec_activated()) {
+		/*
+		 * The descriptors were handed over by the previous server, so
+		 * this process is the replacement and never a client.
+		 */
+		fd = server_start(client_proc, flags, base, -1, NULL);
+	} else
+		fd = client_connect(base, socket_path, client_flags);
 	if (fd == -1) {
 		if (errno == ECONNREFUSED) {
 			fprintf(stderr, "no server running on %s\n",

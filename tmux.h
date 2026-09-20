@@ -68,6 +68,7 @@ struct options;
 struct options_array_item;
 struct options_entry;
 struct prompt;
+struct restart_activation;
 struct window_pane_prompt;
 struct redraw_scene;
 struct redraw_span;
@@ -2645,6 +2646,8 @@ void	proc_toggle_log(struct tmuxproc *);
 pid_t	proc_fork_and_daemon(int *);
 uid_t	proc_get_peer_uid(struct tmuxpeer *);
 gid_t	proc_get_peer_gid(struct tmuxpeer *);
+int	proc_peer_read_enabled(const struct tmuxpeer *);
+void	proc_set_peer_read(struct tmuxpeer *, int);
 
 /* cfg.c */
 extern int cfg_finished;
@@ -3348,6 +3351,23 @@ void	 server_update_socket(void);
 void	 server_add_accept(int);
 void printflike(1, 2) server_add_message(const char *, ...);
 int	 server_create_socket(uint64_t, char **);
+void	 server_remove_accept(void);
+
+/* restart-exec.c */
+int	 restart_exec_activated(void);
+int	 restart_exec_create_socket(uint64_t, struct restart_activation **,
+	     char **);
+void	 restart_exec_activation_free(struct restart_activation *);
+void	 restart_exec_fallback(struct restart_activation *);
+void	 restart_exec_finish(void);
+
+/* server-restart.c */
+int	 server_restart_restore(struct restart_activation *, uint64_t,
+	     char **);
+int	 server_restart_start(char **);
+int	 server_restart_is_quiesced(void);
+int	 server_restart_is_committed(void);
+int	 server_restart_exit_status(void);
 
 /* server-client.c */
 u_int	 server_client_how_many(void);
@@ -3368,6 +3388,7 @@ void	 server_client_suspend(struct client *);
 void	 server_client_detach(struct client *, enum msgtype);
 void	 server_client_exec(struct client *, const char *);
 void	 server_client_loop(void);
+void	 server_client_exit_loop(void);
 const char *server_client_get_cwd(struct client *, struct session *);
 void	 server_client_set_flags(struct client *, const char *);
 const char *server_client_get_flags(struct client *);
@@ -3784,6 +3805,8 @@ void		 window_restart_destroy(struct windows *,
 		     struct window_pane_tree *, struct window *);
 void		 window_pane_set_event(struct window_pane *);
 void		 window_pane_wait_finish(struct window_pane *);
+void		 window_pane_wait_cancel(struct window_pane *);
+void		 window_pane_close_pipe(struct window_pane *);
 struct window_pane *window_get_active_at(struct window *, u_int, u_int);
 struct window_pane *window_find_string(struct window *, const char *);
 int		 window_has_floating_panes(struct window *);
@@ -4304,6 +4327,7 @@ struct spawn_editor_state *spawn_editor(struct client *, const char *, size_t,
 		     spawn_finish_edit_cb, void *);
 void		 spawn_cancel_editor(struct spawn_editor_state *);
 pid_t		 spawn_get_editor_pid(struct spawn_editor_state *);
+void		 spawn_editor_discard(struct window_pane *);
 void		 spawn_editor_finish(struct window_pane *);
 
 /* regsub.c */
