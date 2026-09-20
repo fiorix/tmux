@@ -47,6 +47,7 @@ static uint64_t		 server_client_flags;
 static int		 server_exit;
 static struct event	 server_ev_accept;
 static struct event	 server_ev_tidy;
+static struct restart_activation *server_activation;
 
 struct cmd_find_state	 marked_pane;
 
@@ -181,6 +182,7 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 	sigset_t	 set, oldset;
 	struct client	*c = NULL;
 	char		*cause = NULL;
+	char		*restart_cause = NULL;
 	struct timeval	 tv = { .tv_sec = 3600 };
 
 	sigfillset(&set);
@@ -221,10 +223,12 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 	gettimeofday(&start_time, NULL);
 
 #ifdef HAVE_SYSTEMD
-	server_fd = systemd_create_socket(flags, &cause);
-#else
-	server_fd = server_create_socket(flags, &cause);
+	if (systemd_activated())
+		server_fd = systemd_create_socket(flags, &cause);
+	else
 #endif
+		server_fd = restart_exec_create_socket(flags,
+		    &server_activation, &cause);
 	if (server_fd != -1)
 		server_update_socket();
 	if (~flags & CLIENT_NOFORK)
@@ -254,13 +258,44 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 
 	server_acl_init();
 
-	server_add_accept(0);
-	proc_loop(server_proc, server_loop);
+	/*
+	 * A server handed a checkpoint rebuilds itself from it before accept is
+	 * armed, so no client can see a half restored server. The previous
+	 * server checked that this image can read the checkpoint before it
+	 * committed, so failing here means the panes are lost.
+	 */
+	if (server_fd != -1 && server_restart_restore(server_activation, flags,
+	    &restart_cause) != 0) {
+		log_debug("%s: restore failed: %s", __func__, restart_cause);
+		close(server_fd);
+		server_fd = -1;
+		restart_exec_activation_free(server_activation);
+		server_activation = NULL;
+		fprintf(stderr, "%s\n", restart_cause);
+		free(restart_cause);
+		exit(1);
+	}
+	free(restart_cause);
+	restart_cause = NULL;
 
-	job_kill_all();
-	prompt_save_history();
+	/*
+	 * After a restart is committed the loop ends once the clients have
+	 * gone, and the replacement is executed. If that fails, this server
+	 * still has its panes and carries on.
+	 */
+	for (;;) {
+		server_add_accept(0);
+		proc_loop(server_proc, server_loop);
 
-	exit(0);
+		job_kill_all();
+		prompt_save_history();
+		if (restart_exec_finish() == 0)
+			break;
+		server_restart_resume();
+	}
+	restart_exec_activation_free(server_activation);
+	server_activation = NULL;
+	exit(server_restart_exit_status());
 }
 
 /* Server loop callback. */
@@ -272,11 +307,31 @@ server_loop(void)
 
 	current_time = time(NULL);
 
+	/*
+	 * Once committed the replacement owns the panes, so this process only
+	 * lets its clients finish. Nothing below may run: the ordinary loop
+	 * would resize, redraw and reap against a graph that is no longer this
+	 * process's to touch.
+	 */
+	if (server_restart_is_committed()) {
+		server_client_exit_loop();
+		return (TAILQ_EMPTY(&clients));
+	}
+	if (server_restart_is_quiesced())
+		return (0);
+
 	do {
 		items = cmdq_next(NULL);
+		if (server_restart_is_quiesced() ||
+		    server_restart_is_committed())
+			return (0);
 		TAILQ_FOREACH(c, &clients, entry) {
-			if (c->flags & CLIENT_IDENTIFIED)
+			if (c->flags & CLIENT_IDENTIFIED) {
 				items += cmdq_next(c);
+				if (server_restart_is_quiesced() ||
+				    server_restart_is_committed())
+					return (0);
+			}
 		}
 	} while (items != 0);
 
@@ -416,6 +471,12 @@ server_add_accept(int timeout)
 
 	if (server_fd == -1)
 		return;
+	/*
+	 * Arming accept between quiesce and commit would let a client connect
+	 * to a server that is handing its descriptors away.
+	 */
+	if (server_restart_is_quiesced() || server_restart_is_committed())
+		return;
 
 	if (event_initialized(&server_ev_accept))
 		event_del(&server_ev_accept);
@@ -431,6 +492,14 @@ server_add_accept(int timeout)
 	}
 }
 
+/* Stop accepting connections. */
+void
+server_remove_accept(void)
+{
+	if (event_initialized(&server_ev_accept))
+		event_del(&server_ev_accept);
+}
+
 /* Signal handler. */
 static void
 server_signal(int sig)
@@ -442,6 +511,13 @@ server_signal(int sig)
 	case SIGINT:
 	case SIGTERM:
 		server_exit = 1;
+		/*
+		 * A committed process is already releasing its clients. Telling
+		 * them to exit again would destroy sessions the replacement now
+		 * owns.
+		 */
+		if (server_restart_is_committed())
+			break;
 		server_send_exit();
 		break;
 	case SIGCHLD:
@@ -497,6 +573,12 @@ server_child_exited(pid_t pid, int status)
 	struct window		*w, *w1;
 	struct window_pane	*wp;
 
+	/*
+	 * The pane processes were handed over, so their exits are the
+	 * replacement's to observe. Reaping still happens in the caller.
+	 */
+	if (server_restart_is_committed())
+		return;
 	RB_FOREACH_SAFE(w, windows, &windows, w1) {
 		TAILQ_FOREACH(wp, &w->panes, entry) {
 			if (wp->pid == pid) {
@@ -526,6 +608,8 @@ server_child_stopped(pid_t pid, int status)
 	struct window_pane	*wp;
 
 	if (WSTOPSIG(status) == SIGTTIN || WSTOPSIG(status) == SIGTTOU)
+		return;
+	if (server_restart_is_committed())
 		return;
 
 	RB_FOREACH(w, windows, &windows) {

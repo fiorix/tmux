@@ -446,6 +446,13 @@ server_client_lost(struct client *c)
 	}
 	server_client_unref(c);
 
+	/*
+	 * A committed process has already handed its panes over, so resizing,
+	 * destroying unattached sessions or rearming accept here would act on
+	 * state that belongs to the replacement.
+	 */
+	if (server_restart_is_committed())
+		return;
 	server_add_accept(0); /* may be more file descriptors now */
 
 	recalculate_sizes();
@@ -1749,6 +1756,19 @@ server_client_handle_key_after(struct client *c, struct key_event *event,
 	return (server_client_handle_key0(c, event, after, next));
 }
 
+/*
+ * The committed drain. Only the exit check runs, because resize, redraw and
+ * state reset all act on panes this process no longer owns.
+ */
+void
+server_client_exit_loop(void)
+{
+	struct client	*c, *c1;
+
+	TAILQ_FOREACH_SAFE(c, &clients, entry, c1)
+		server_client_check_exit(c, 0);
+}
+
 /* Client functions that need to happen every loop. */
 void
 server_client_loop(void)
@@ -2557,6 +2577,15 @@ server_client_dispatch(struct imsg *imsg, void *arg)
 	}
 
 	datalen = imsg->hdr.len - IMSG_HEADER_SIZE;
+
+	/*
+	 * While committed the only message that may act is the client saying
+	 * it has finished. Anything else would run a command or change the
+	 * state of panes this process has handed over, and the sender has
+	 * already been told to exit.
+	 */
+	if (server_restart_is_committed() && imsg->hdr.type != MSG_EXITING)
+		return;
 
 	switch (imsg->hdr.type) {
 	case MSG_IDENTIFY_CLIENTPID:

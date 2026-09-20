@@ -500,6 +500,10 @@ main(int argc, char **argv)
 	setlocale(LC_TIME, "");
 	tzset();
 
+	/* A server about to restart into this image is checking it. */
+	if (restart_exec_checking())
+		exit(restart_exec_check());
+
 	if (**argv == '-')
 		flags = CLIENT_LOGIN;
 	tmux_path = make_path(*argv);

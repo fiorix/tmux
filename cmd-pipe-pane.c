@@ -52,6 +52,24 @@ const struct cmd_entry cmd_pipe_pane_entry = {
 	.exec = cmd_pipe_pane_exec
 };
 
+/*
+ * Close tmux's end of the pipe transport without disturbing the pane. Unlike
+ * the teardown in cmd_pipe_pane_exec this never consults
+ * window_pane_destroy_ready, so a pane whose only remaining reference was the
+ * pipe is not destroyed, and the recorded pipe PID is never signalled.
+ */
+void
+window_pane_close_pipe(struct window_pane *wp)
+{
+	if (wp->pipe_fd == -1)
+		return;
+
+	bufferevent_free(wp->pipe_event);
+	wp->pipe_event = NULL;
+	close(wp->pipe_fd);
+	wp->pipe_fd = -1;
+}
+
 static enum cmd_retval
 cmd_pipe_pane_exec(struct cmd *self, struct cmdq_item *item)
 {
