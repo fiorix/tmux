@@ -248,6 +248,29 @@ environ_log(struct environ *env, const char *fmt, ...)
 	free(prefix);
 }
 
+static const char *const environ_systemd_names[] = {
+	"LISTEN_PID",
+	"LISTEN_PIDFDID",
+	"LISTEN_FDS",
+	"LISTEN_FDNAMES",
+	"NOTIFY_SOCKET",
+	"FDSTORE",
+	"WATCHDOG_PID",
+	"WATCHDOG_USEC",
+	"MEMORY_PRESSURE_WATCH",
+	"MEMORY_PRESSURE_WRITE"
+};
+
+/* Unset the variables telling a process to act as the service. */
+void
+environ_unset_systemd(struct environ *env)
+{
+	u_int	i;
+
+	for (i = 0; i < nitems(environ_systemd_names); i++)
+		environ_unset(env, environ_systemd_names[i]);
+}
+
 /* Create initial environment for new child. */
 struct environ *
 environ_for_session(struct session *s, int no_TERM)
@@ -268,12 +291,6 @@ environ_for_session(struct session *s, int no_TERM)
 		environ_set(env, "TERM_PROGRAM_VERSION", 0, "%s", getversion());
 		environ_set(env, "COLORTERM", 0, "truecolor");
 	}
-
-#ifdef HAVE_SYSTEMD
-	environ_clear(env, "LISTEN_PID");
-	environ_clear(env, "LISTEN_FDS");
-	environ_clear(env, "LISTEN_FDNAMES");
-#endif
 
 	if (s != NULL)
 		idx = s->id;
