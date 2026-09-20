@@ -389,6 +389,12 @@ server_update_socket(void)
 	int		 n, mode;
 	struct stat      sb;
 
+#ifdef HAVE_SYSTEMD
+	/* An activated socket and its mode belong to the service manager. */
+	if (systemd_activated())
+		return;
+#endif
+
 	n = 0;
 	RB_FOREACH(s, sessions, &sessions) {
 		if (s->attached != 0) {
@@ -517,6 +523,13 @@ server_signal(int sig)
 		server_child_signal();
 		break;
 	case SIGUSR1:
+#ifdef HAVE_SYSTEMD
+		if (systemd_activated()) {
+			log_debug("%s: socket owned by the service manager",
+			    __func__);
+			break;
+		}
+#endif
 		event_del(&server_ev_accept);
 		fd = server_create_socket(server_client_flags, NULL);
 		if (fd != -1) {
