@@ -396,6 +396,12 @@ server_update_socket(void)
 	int		 n, mode;
 	struct stat      sb;
 
+#ifdef HAVE_SYSTEMD
+	/* An activated socket and its mode belong to the service manager. */
+	if (systemd_activated())
+		return;
+#endif
+
 	n = 0;
 	RB_FOREACH(s, sessions, &sessions) {
 		if (s->attached != 0) {
