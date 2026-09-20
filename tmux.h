@@ -2953,6 +2953,7 @@ void	environ_unset(struct environ *, const char *);
 void	environ_update(struct options *, struct environ *, struct environ *);
 void	environ_push(struct environ *);
 void printflike(2, 3) environ_log(struct environ *, const char *, ...);
+void	environ_unset_systemd(struct environ *);
 struct environ *environ_for_session(struct session *, int);
 
 /* tty-draw.c */
