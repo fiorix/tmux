@@ -40,11 +40,13 @@ struct environ	*global_environ;
 
 struct timeval	 start_time;
 const char	*socket_path;
+const char	*tmux_path;
 int		 ptm_fd = -1;
 const char	*shell_command;
 
 static __dead void	 usage(int);
 static char		*make_label(const char *, char **);
+static char		*make_path(const char *);
 
 static int		 areshell(const char *);
 static const char	*getshell(void);
@@ -295,6 +297,50 @@ fail:
 	return (NULL);
 }
 
+/*
+ * Resolve this program's path the way the shell found it, before anything can
+ * change the working directory. This names the path rather than the running
+ * file, so that a server restarted after an upgrade runs the new binary.
+ */
+static char *
+make_path(const char *argv0)
+{
+	char		*copy, *found = NULL, *path, *dir, *next;
+	const char	*name = argv0;
+	struct stat	 sb;
+
+	if (*name == '-')
+		name++;
+	if (*name == '\0')
+		return (NULL);
+
+	if (strchr(name, '/') != NULL)
+		return (realpath(name, NULL));
+
+	path = getenv("PATH");
+	if (path == NULL || *path == '\0')
+		return (NULL);
+	copy = xstrdup(path);
+	next = copy;
+	while ((dir = strsep(&next, ":")) != NULL) {
+		if (*dir == '\0')
+			dir = (char *)".";
+		xasprintf(&found, "%s/%s", dir, name);
+		if (stat(found, &sb) == 0 && S_ISREG(sb.st_mode) &&
+		    access(found, X_OK) == 0)
+			break;
+		free(found);
+		found = NULL;
+	}
+	free(copy);
+	if (found == NULL)
+		return (NULL);
+
+	path = realpath(found, NULL);
+	free(found);
+	return (path);
+}
+
 char *
 shell_argv0(const char *shell, int is_login)
 {
@@ -456,6 +502,7 @@ main(int argc, char **argv)
 
 	if (**argv == '-')
 		flags = CLIENT_LOGIN;
+	tmux_path = make_path(*argv);
 
 	global_environ = environ_create();
 	for (var = environ; *var != NULL; var++)

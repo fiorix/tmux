@@ -135,6 +135,13 @@ restart_codec_features(void)
 #endif
 }
 
+/* Get the largest state this build will decode. */
+size_t
+restart_codec_max_size(void)
+{
+	return (RESTART_MAX_SIZE);
+}
+
 /* Create a writer. */
 struct restart_writer *
 restart_writer_create(char **cause)

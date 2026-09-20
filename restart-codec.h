@@ -37,6 +37,8 @@ void restart_terminal_free(struct restart_terminal *);
 
 typedef int (*restart_fd_lookup_cb)(void *, u_int, pid_t, int *);
 
+size_t restart_codec_max_size(void);
+
 int restart_state_encode(struct ibuf **, char **);
 int restart_state_decode(const void *, size_t, struct restart_state **,
     char **);
