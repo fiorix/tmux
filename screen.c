@@ -72,6 +72,22 @@ screen_free_titles(struct screen *s)
 	s->ntitles = 0;
 }
 
+/* Get title from the stack, oldest first. */
+const char *
+screen_title_at(const struct screen *s, u_int n)
+{
+	struct screen_title_entry	*title_entry;
+
+	if (s->titles == NULL)
+		return (NULL);
+
+	TAILQ_FOREACH(title_entry, s->titles, entry) {
+		if (n-- == 0)
+			return (title_entry->text);
+	}
+	return (NULL);
+}
+
 /* Create a new screen. */
 void
 screen_init(struct screen *s, u_int sx, u_int sy, u_int hlimit)

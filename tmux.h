@@ -1067,6 +1067,47 @@ struct progress_bar {
 	int			progress;
 };
 
+/* Input parser cell. */
+struct input_cell {
+	struct grid_cell	 cell;
+	int			 set;
+	int			 g0set;	/* 1 if ACS */
+	int			 g1set;	/* 1 if ACS */
+};
+
+/* Input parser string terminator. */
+enum input_end_type {
+	INPUT_END_ST,
+	INPUT_END_BEL
+};
+
+/* Saved parser state. The ground timer is derived from the state, not saved. */
+struct input_parser_state {
+	const char		*state;
+
+	struct input_cell	 cell;
+	struct input_cell	 old_cell;
+	u_int			 old_cx;
+	u_int			 old_cy;
+	int			 old_mode;
+
+	u_char			 interm_buf[4];
+	size_t			 interm_len;
+
+	u_char			 param_buf[64];
+	size_t			 param_len;
+
+	u_char			*input_buf;
+	size_t			 input_len;
+	enum input_end_type	 input_end;
+
+	struct utf8_data	 utf8data;
+	int			 utf8started;
+	struct utf8_data	 last;
+
+	int			 flags;
+};
+
 /* Virtual screen. */
 struct screen_sel;
 struct screen_titles;
@@ -3425,6 +3466,10 @@ void	 input_parse_screen(struct input_ctx *, struct screen *,
 void	 input_reply_clipboard(struct bufferevent *, const char *, size_t,
 	     const char *, char);
 void	 input_set_buffer_size(size_t);
+size_t	 input_get_buffer_size(void);
+void	 input_save_parser(const struct input_ctx *,
+	     struct input_parser_state *);
+void	 input_free_parser_state(struct input_parser_state *);
 void	 input_request_reply(struct client *, enum input_request_type, void *);
 void	 input_cancel_requests(struct client *);
 
@@ -3656,6 +3701,7 @@ int	 screen_set_title(struct screen *, const char *, int);
 int	 screen_set_path(struct screen *, const char *, int);
 void	 screen_push_title(struct screen *);
 void	 screen_pop_title(struct screen *);
+const char *screen_title_at(const struct screen *, u_int);
 void	 screen_set_progress_bar(struct screen *, enum progress_bar_state, int);
 void	 screen_resize(struct screen *, u_int, u_int, int);
 void	 screen_resize_cursor(struct screen *, u_int, u_int, int, int, int);
@@ -4207,6 +4253,7 @@ char		*regsub(const char *, const char *, const char *, int);
 /* image.c */
 int		 image_free_all(struct screen *);
 struct image	*image_store(struct screen *, struct sixel_image *);
+u_int		 image_limit(void);
 int		 image_check_line(struct screen *, u_int, u_int);
 int		 image_check_area(struct screen *, u_int, u_int, u_int, u_int);
 int		 image_scroll_up(struct screen *, u_int);
@@ -4217,6 +4264,11 @@ struct sixel_image *sixel_parse(const char *, size_t, u_int, u_int, u_int);
 void		 sixel_free(struct sixel_image *);
 void		 sixel_log(struct sixel_image *);
 void		 sixel_size_in_cells(struct sixel_image *, u_int *, u_int *);
+void		 sixel_size_in_pixels(struct sixel_image *, u_int *, u_int *);
+void		 sixel_cell_size(struct sixel_image *, u_int *, u_int *);
+struct sixel_image *sixel_restart_parse(const void *, size_t, u_int, u_int,
+		     u_int, u_int);
+char		*sixel_restart_print(struct sixel_image *, size_t *);
 struct sixel_image *sixel_scale(struct sixel_image *, u_int, u_int, u_int,
 		     u_int, u_int, u_int, int);
 char		*sixel_print(struct sixel_image *, struct sixel_image *,
@@ -4241,6 +4293,12 @@ u_int	 		 hyperlinks_put(struct hyperlinks *, const char *,
 			     const char *);
 int			 hyperlinks_get(struct hyperlinks *, u_int,
 			     const char **, const char **, const char **);
+struct hyperlinks_uri	*hyperlinks_first(struct hyperlinks *);
+struct hyperlinks_uri	*hyperlinks_next(struct hyperlinks_uri *);
+u_int			 hyperlinks_entry(struct hyperlinks_uri *,
+			     const char **, const char **, const char **);
+u_int			 hyperlinks_next_inner(struct hyperlinks *);
+u_int			 hyperlinks_limit(void);
 struct hyperlinks	*hyperlinks_init(void);
 struct hyperlinks	*hyperlinks_copy(struct hyperlinks *);
 void			 hyperlinks_reset(struct hyperlinks *);

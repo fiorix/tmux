@@ -196,6 +196,10 @@ dist_tmux_SOURCES = \
 	prompt.c \
 	regsub.c \
 	resize.c \
+	restart-codec-private.h \
+	restart-codec.c \
+	restart-codec.h \
+	restart-screen.c \
 	screen-redraw.c \
 	screen-write.c \
 	screen.c \

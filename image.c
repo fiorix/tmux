@@ -27,6 +27,16 @@ static struct images	all_images = TAILQ_HEAD_INITIALIZER(all_images);
 static u_int		all_images_count;
 #define MAX_IMAGE_COUNT 20
 
+/*
+ * Get the most images that can be held. image_store evicts on reaching the
+ * limit, so one fewer than it can be present at once.
+ */
+u_int
+image_limit(void)
+{
+	return (MAX_IMAGE_COUNT - 1);
+}
+
 static void printflike(3, 4)
 image_log(struct image *im, const char* from, const char* fmt, ...)
 {
