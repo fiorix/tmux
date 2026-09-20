@@ -55,7 +55,7 @@ static void	 format_defaults_winlink(struct format_tree *,
 /* Entry in format job tree. */
 struct format_job {
 	struct client		*client;
-	u_int			 tag;
+	uint64_t		 tag;
 	const char		*cmd;
 	const char		*expanded;
 
@@ -179,7 +179,7 @@ struct format_tree {
 	struct cmdq_item	*item;
 	struct client		*client;
 	int			 flags;
-	u_int			 tag;
+	uint64_t		 tag;
 
 	struct mouse_event	 m;
 
@@ -4276,7 +4276,8 @@ format_create_add_item(struct format_tree *ft, struct cmdq_item *item)
 
 /* Create a new tree. */
 struct format_tree *
-format_create(struct client *c, struct cmdq_item *item, int tag, int flags)
+format_create(struct client *c, struct cmdq_item *item, uint64_t tag,
+    int flags)
 {
 	struct format_tree	*ft;
 
