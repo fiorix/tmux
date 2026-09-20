@@ -1,5 +1,9 @@
 CHANGES FROM 3.7c TO 3.8
 
+* Add restart-server, which replaces the server with a new copy of its own
+  image while keeping the sessions, windows and panes. The programs running in
+  the panes are not restarted.
+
 * Many improvements to floating panes:
 
   - new-pane and split-window can now set the title with -T and border lines
