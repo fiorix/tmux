@@ -443,8 +443,14 @@ void		*recallocarray(void *, size_t, size_t, size_t);
 
 #ifdef HAVE_SYSTEMD
 /* systemd.c */
+struct systemd_activation;
+
 int		 systemd_activated(void);
-int		 systemd_create_socket(int, char **);
+int		 systemd_create_socket(int, struct systemd_activation **,
+		     char **);
+int		 systemd_activation_is_restart(
+		     const struct systemd_activation *);
+void		 systemd_activation_free(struct systemd_activation *);
 int		 systemd_move_to_new_cgroup(char **);
 #endif
 
