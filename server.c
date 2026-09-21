@@ -48,6 +48,9 @@ static int		 server_exit;
 static struct event	 server_ev_accept;
 static struct event	 server_ev_tidy;
 static struct restart_activation *server_activation;
+#ifdef HAVE_SYSTEMD
+static struct systemd_activation *server_systemd_activation;
+#endif
 
 struct cmd_find_state	 marked_pane;
 
@@ -223,9 +226,19 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 	gettimeofday(&start_time, NULL);
 
 #ifdef HAVE_SYSTEMD
-	if (systemd_activated())
-		server_fd = systemd_create_socket(flags, &cause);
-	else
+	if (systemd_activated()) {
+		server_fd = systemd_create_socket(flags,
+		    &server_systemd_activation, &cause);
+		if (server_fd != -1 &&
+		    systemd_activation_is_restart(server_systemd_activation)) {
+			xasprintf(&cause, "systemd activation error: this "
+			    "server cannot restore a restarted server's state");
+			close(server_fd);
+			server_fd = -1;
+			systemd_activation_free(server_systemd_activation);
+			server_systemd_activation = NULL;
+		}
+	} else
 #endif
 		server_fd = restart_exec_create_socket(flags,
 		    &server_activation, &cause);
@@ -286,6 +299,10 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 	prompt_save_history();
 	restart_exec_activation_free(server_activation);
 	server_activation = NULL;
+#ifdef HAVE_SYSTEMD
+	systemd_activation_free(server_systemd_activation);
+	server_systemd_activation = NULL;
+#endif
 
 	restart_exec_finish();
 	exit(server_restart_exit_status());
