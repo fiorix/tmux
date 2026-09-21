@@ -24,16 +24,139 @@
 #include <systemd/sd-login.h>
 #include <systemd/sd-id128.h>
 
+#include <errno.h>
+#include <limits.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "tmux.h"
+#include "restart-exec.h"
 
 #ifndef SD_ID128_UUID_FORMAT_STR
 #define SD_ID128_UUID_FORMAT_STR \
 	"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x"
 #endif
+
+#define SYSTEMD_SOCKET_FD_NAME "tmux-server"
+#define SYSTEMD_STATE_FD_NAME "tmux.restart.state"
+#define SYSTEMD_PANE_FD_PREFIX "tmux.p."
+
+struct systemd_activation {
+	enum restart_activation_type	 type;
+	int				 state_fd;
+	struct restart_fd	*panes;
+	size_t				 pane_count;
+};
+
+static void systemd_activation_error(char **, const char *, ...)
+    printflike(2, 3);
+
+static void
+systemd_activation_error(char **cause, const char *fmt, ...)
+{
+	va_list	 ap;
+	char	*msg;
+
+	if (cause == NULL)
+		return;
+	va_start(ap, fmt);
+	xvasprintf(&msg, fmt, ap);
+	va_end(ap);
+	xasprintf(cause, "systemd activation error: %s", msg);
+	free(msg);
+}
+
+static void
+systemd_activation_close_fds(int fds)
+{
+	while (fds > 0)
+		close(SD_LISTEN_FDS_START + --fds);
+}
+
+static void
+systemd_activation_free_names(char **names, int count)
+{
+	int	 i;
+
+	if (names == NULL)
+		return;
+	for (i = 0; i < count; i++)
+		free(names[i]);
+	free(names);
+}
+
+static int
+systemd_activation_parse_number(const char *s, size_t len, uint64_t limit,
+    uint64_t *value)
+{
+	uint64_t	 n = 0;
+	size_t		 i;
+
+	if (len == 0 || (len != 1 && s[0] == '0'))
+		return (-1);
+	for (i = 0; i < len; i++) {
+		if (s[i] < '0' || s[i] > '9')
+			return (-1);
+		if (n > (limit - (s[i] - '0')) / 10)
+			return (-1);
+		n = n * 10 + (s[i] - '0');
+	}
+	*value = n;
+	return (0);
+}
+
+static int
+systemd_activation_parse_pane(const char *name, u_int *pane_id, pid_t *pid)
+{
+	const char	*first, *last;
+	uint64_t	 number;
+
+	if (strncmp(name, SYSTEMD_PANE_FD_PREFIX,
+	    sizeof SYSTEMD_PANE_FD_PREFIX - 1) != 0)
+		return (-1);
+	first = name + sizeof SYSTEMD_PANE_FD_PREFIX - 1;
+	last = strchr(first, '.');
+	if (last == NULL || strchr(last + 1, '.') != NULL)
+		return (-1);
+	if (systemd_activation_parse_number(first, last - first, UINT_MAX,
+	    &number) != 0)
+		return (-1);
+	*pane_id = number;
+	first = last + 1;
+	if (systemd_activation_parse_number(first, strlen(first), INT_MAX,
+	    &number) != 0 || number == 0)
+		return (-1);
+	*pid = number;
+	return (0);
+}
+
+static int
+systemd_activation_pane_cmp(const void *lhs, const void *rhs)
+{
+	const struct restart_fd	*a = lhs;
+	const struct restart_fd	*b = rhs;
+
+	if (a->pane_id < b->pane_id)
+		return (-1);
+	if (a->pane_id > b->pane_id)
+		return (1);
+	return (0);
+}
+
+static int
+systemd_activation_socket_path(int fd, char **path)
+{
+	struct sockaddr_un	 sa;
+	socklen_t		 addrlen = sizeof sa;
+
+	memset(&sa, 0, sizeof sa);
+	if (getsockname(fd, (struct sockaddr *)&sa, &addrlen) == -1)
+		return (-1);
+	*path = xstrndup(sa.sun_path, sizeof sa.sun_path);
+	return (0);
+}
 
 int
 systemd_activated(void)
@@ -42,37 +165,189 @@ systemd_activated(void)
 }
 
 int
-systemd_create_socket(int flags, char **cause)
+systemd_create_socket(int flags, struct systemd_activation **activation,
+    char **cause)
 {
-	int			fds;
-	int			fd;
-	struct sockaddr_un	sa;
-	socklen_t		addrlen = sizeof sa;
+	struct systemd_activation	*a = NULL;
+	struct restart_fd	 pane;
+	char			       **names = NULL, *path = NULL;
+	size_t				 i, j;
+	int				 candidate_fds, fd, fds, listener;
+	int				 r, state;
 
-	fds = sd_listen_fds(0);
-	if (fds > 1) { /* too many file descriptors */
-		errno = E2BIG;
+	if (activation != NULL)
+		*activation = NULL;
+	if (cause != NULL)
+		*cause = NULL;
+	candidate_fds = sd_listen_fds(0);
+	fds = sd_listen_fds_with_names(1, &names);
+	if (fds < 0) {
+		if (candidate_fds > 0)
+			systemd_activation_close_fds(candidate_fds);
+		systemd_activation_error(cause, "%s", strerror(-fds));
+		return (-1);
+	}
+	if (fds == 0)
+		return (server_create_socket(flags, cause));
+	if (activation == NULL) {
+		systemd_activation_error(cause, "missing activation output");
 		goto fail;
 	}
 
-	if (fds == 1) { /* socket-activated */
+	a = xcalloc(1, sizeof *a);
+	a->state_fd = -1;
+	if (fds == 1) {
 		fd = SD_LISTEN_FDS_START;
-		if (!sd_is_socket_unix(fd, SOCK_STREAM, 1, NULL, 0)) {
-			errno = EPFNOSUPPORT;
+		r = sd_is_socket_unix(fd, SOCK_STREAM, 1, NULL, 0);
+		if (r <= 0) {
+			if (r < 0)
+				errno = -r;
+			else
+				errno = EPFNOSUPPORT;
+			systemd_activation_error(cause,
+			    "descriptor %d is not a listening Unix "
+			    "stream socket", fd);
 			goto fail;
 		}
-		if (getsockname(fd, (struct sockaddr *)&sa, &addrlen) == -1)
+		if (systemd_activation_socket_path(fd, &path) != 0) {
+			systemd_activation_error(cause,
+			    "descriptor %d has no socket path: %s", fd,
+			    strerror(errno));
 			goto fail;
-		socket_path = xstrdup(sa.sun_path);
-		return (fd);
+		}
+		a->type = RESTART_ACTIVATION_SOCKET;
+		goto done;
 	}
 
-	return (server_create_socket(flags, cause));
+	listener = state = -1;
+	for (i = 0; i < (size_t)fds; i++) {
+		fd = SD_LISTEN_FDS_START + i;
+		if (names[i] == NULL) {
+			systemd_activation_error(cause,
+			    "descriptor %d has no name", fd);
+			goto fail;
+		}
+		if (strcmp(names[i], SYSTEMD_SOCKET_FD_NAME) == 0) {
+			if (listener != -1) {
+				systemd_activation_error(cause,
+				    "descriptor %d duplicates the server "
+				    "socket", fd);
+				goto fail;
+			}
+			r = sd_is_socket_unix(fd, SOCK_STREAM, 1, NULL, 0);
+			if (r <= 0) {
+				systemd_activation_error(cause,
+				    "descriptor %d is not a listening "
+				    "Unix stream socket", fd);
+				goto fail;
+			}
+			listener = fd;
+			continue;
+		}
+		if (strcmp(names[i], SYSTEMD_STATE_FD_NAME) == 0) {
+			if (state != -1) {
+				systemd_activation_error(cause,
+				    "descriptor %d duplicates the restart "
+				    "state", fd);
+				goto fail;
+			}
+			state = fd;
+			continue;
+		}
+		if (systemd_activation_parse_pane(names[i], &pane.pane_id,
+		    &pane.pid) != 0) {
+			systemd_activation_error(cause,
+			    "descriptor %d has an invalid name", fd);
+			goto fail;
+		}
+		for (j = 0; j < a->pane_count; j++) {
+			if (a->panes[j].pane_id == pane.pane_id) {
+				systemd_activation_error(cause,
+				    "descriptor %d duplicates a pane ID", fd);
+				goto fail;
+			}
+			if (a->panes[j].pid == pane.pid) {
+				systemd_activation_error(cause,
+				    "descriptor %d duplicates a pane PID", fd);
+				goto fail;
+			}
+		}
+		pane.fd = fd;
+		a->panes = xreallocarray(a->panes, a->pane_count + 1,
+		    sizeof *a->panes);
+		a->panes[a->pane_count++] = pane;
+	}
+	if (listener == -1 || state == -1) {
+		systemd_activation_error(cause,
+		    "restart descriptors are missing the server socket or "
+		    "state");
+		goto fail;
+	}
+	if (a->pane_count > 1) {
+		qsort(a->panes, a->pane_count, sizeof *a->panes,
+		    systemd_activation_pane_cmp);
+	}
+	if (systemd_activation_socket_path(listener, &path) != 0) {
+		systemd_activation_error(cause,
+		    "descriptor %d has no socket path: %s", listener,
+		    strerror(errno));
+		goto fail;
+	}
+	a->type = RESTART_ACTIVATION_RESTORE;
+	a->state_fd = state;
+	fd = listener;
+
+done:
+	systemd_activation_free_names(names, fds);
+	socket_path = path;
+	*activation = a;
+	return (fd);
 
 fail:
-	if (cause != NULL)
-		xasprintf(cause, "systemd socket error (%s)", strerror(errno));
+	systemd_activation_close_fds(fds);
+	systemd_activation_free_names(names, fds);
+	if (a != NULL) {
+		free(a->panes);
+		free(a);
+	}
+	free(path);
 	return (-1);
+}
+
+int
+systemd_activation_is_restart(const struct systemd_activation *activation)
+{
+	return (activation != NULL &&
+	    activation->type == RESTART_ACTIVATION_RESTORE);
+}
+
+static void
+systemd_activation_close_restart_fds(struct systemd_activation *activation)
+{
+	size_t	 i;
+
+	if (activation == NULL)
+		return;
+	if (activation->state_fd != -1) {
+		close(activation->state_fd);
+		activation->state_fd = -1;
+	}
+	for (i = 0; i < activation->pane_count; i++) {
+		if (activation->panes[i].fd != -1) {
+			close(activation->panes[i].fd);
+			activation->panes[i].fd = -1;
+		}
+	}
+}
+
+void
+systemd_activation_free(struct systemd_activation *activation)
+{
+	if (activation == NULL)
+		return;
+	systemd_activation_close_restart_fds(activation);
+	free(activation->panes);
+	free(activation);
 }
 
 struct systemd_job_watch {
