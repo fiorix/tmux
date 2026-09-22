@@ -254,6 +254,9 @@ endif
 # Add compat file for systemd.
 if HAVE_SYSTEMD
 nodist_tmux_SOURCES += compat/systemd.c
+systemduserunitdir = @SYSTEMD_USER_UNIT_DIR@
+dist_systemduserunit_DATA = tmux@.socket
+nodist_systemduserunit_DATA = tmux@.service
 endif
 
 # Add compat file for utf8proc.
