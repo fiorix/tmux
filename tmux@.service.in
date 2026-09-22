@@ -1,0 +1,16 @@
+[Unit]
+Description=tmux server (%i)
+Requires=tmux@%i.socket
+After=tmux@%i.socket
+
+[Service]
+Type=notify
+NotifyAccess=main
+Environment=TMUX_TMPDIR=%t
+ExecStart="@SYSTEMD_TMUX_EXEC@" -D -L %i
+KillMode=process
+Restart=on-failure
+FileDescriptorStoreMax=4096
+@SYSTEMD_FILE_DESCRIPTOR_STORE_PRESERVE@
+LimitNOFILE=16384
+TimeoutStartSec=infinity
