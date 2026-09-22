@@ -451,6 +451,7 @@ int		 systemd_create_socket(int, struct systemd_activation **,
 int		 systemd_activation_is_restart(
 		     const struct systemd_activation *);
 void		 systemd_activation_free(struct systemd_activation *);
+int		 systemd_ready(char **);
 int		 systemd_move_to_new_cgroup(char **);
 #endif
 

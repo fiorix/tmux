@@ -514,11 +514,13 @@ window_pane_destroy_ready(struct window_pane *wp)
 
 	/*
 	 * If a command queue item is blocked on this pane, wait for the
-	 * child's exit status before destroying it.
+	 * current child's exit status. An adopted pane cannot receive one.
 	 */
-	if (wp->wait_item != NULL && (~wp->flags & PANE_STATUSREADY))
+	if (wp->wait_item != NULL &&
+	    (wp->flags & (PANE_STATUSREADY|PANE_ADOPTED)) == 0)
 		return (0);
-	if (wp->editor != NULL && (~wp->flags & PANE_STATUSREADY))
+	if (wp->editor != NULL &&
+	    (wp->flags & (PANE_STATUSREADY|PANE_ADOPTED)) == 0)
 		return (0);
 	return (1);
 }

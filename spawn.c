@@ -346,7 +346,10 @@ spawn_pane(struct spawn_context *sc, char **cause)
 		}
 
 		new_wp = sc->wp0;
-		new_wp->flags &= ~(PANE_STATUSREADY|PANE_STATUSDRAWN);
+		new_wp->flags &= ~(PANE_ADOPTED|PANE_EMPTY|PANE_EXITED|
+		    PANE_STATUSREADY|PANE_STATUSDRAWN);
+		new_wp->status = 0;
+		memset(&new_wp->dead_time, 0, sizeof new_wp->dead_time);
 	} else {
 		if (sc->lc == NULL) {
 			new_wp = window_add_pane(w, NULL, hlimit, sc->flags);

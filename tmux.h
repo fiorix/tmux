@@ -1386,6 +1386,7 @@ struct window_pane {
 #define PANE_CAPTUREALLKEYS 0x100000
 #define PANE_FLOATOVERZOOM 0x200000
 #define PANE_CLOSEONCANCEL 0x400000
+#define PANE_ADOPTED 0x800000
 
 	bitstr_t	*sync_dirty;
 	u_int		 sync_dirty_size;
@@ -3363,6 +3364,8 @@ void	 restart_exec_fallback(struct restart_activation *);
 void	 restart_exec_finish(void);
 
 /* server-restart.c */
+void	 server_restart_init(void);
+int	 server_restart_uses_systemd(void);
 int	 server_restart_restore(struct restart_activation *, uint64_t,
 	     char **);
 int	 server_restart_start(char **);

@@ -522,6 +522,11 @@ if test x"$enable_systemd" = xyes; then
 	)
 	if test "x$found_systemd" = xyes; then
 		AC_DEFINE(HAVE_SYSTEMD)
+		PKG_CHECK_EXISTS(
+			[libsystemd >= 254],
+			[AC_DEFINE(HAVE_SYSTEMD_RESTART)],
+			[:]
+		)
 	else
 		AC_MSG_ERROR("systemd not found")
 	fi
