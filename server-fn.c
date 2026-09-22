@@ -39,19 +39,22 @@ server_fire_pane_exit(const char *name, struct window_pane *wp)
 	int			 status = wp->status;
 	const char		*signame;
 
-	if (WIFSIGNALED(status))
-		signame = sig2name(WTERMSIG(status));
-
 	ep = event_payload_create();
 	cmd_find_from_pane(&fs, wp, 0);
 	event_payload_set_target(ep, &fs);
 	event_payload_set_pane(ep, "pane", wp);
 	event_payload_set_window(ep, "window", wp->window);
-	if (WIFEXITED(status))
-		event_payload_set_int(ep, "exit_status", WEXITSTATUS(status));
-	else if (WIFSIGNALED(status))
-		event_payload_set_string(ep, "exit_signal", "%s", signame);
-	event_payload_set_int(ep, "exit_success", status == 0);
+	if (wp->flags & PANE_STATUSREADY) {
+		if (WIFEXITED(status))
+			event_payload_set_int(ep, "exit_status",
+			    WEXITSTATUS(status));
+		else if (WIFSIGNALED(status)) {
+			signame = sig2name(WTERMSIG(status));
+			event_payload_set_string(ep, "exit_signal", "%s",
+			    signame);
+		}
+		event_payload_set_int(ep, "exit_success", status == 0);
+	}
 	events_fire(name, ep);
 }
 
@@ -379,7 +382,7 @@ server_destroy_pane(struct window_pane *wp, int notify)
 		wp->pipe_fd = -1;
 	}
 
-	if (~wp->flags & PANE_STATUSREADY)
+	if ((wp->flags & (PANE_STATUSREADY|PANE_ADOPTED)) == 0)
 		return;
 	remain_on_exit = options_get_number(wp->options, "remain-on-exit");
 	switch (remain_on_exit) {
@@ -387,13 +390,16 @@ server_destroy_pane(struct window_pane *wp, int notify)
 		break;
 	case 2:
 	case 4:
-		if (WIFEXITED(wp->status) && WEXITSTATUS(wp->status) == 0)
+		if ((wp->flags & PANE_STATUSREADY) &&
+		    WIFEXITED(wp->status) && WEXITSTATUS(wp->status) == 0)
 			break;
 		/* FALLTHROUGH */
 	case 1:
 	case 3:
 		if (wp->flags & PANE_STATUSDRAWN)
 			return;
+		if (wp->flags & PANE_STATUSREADY)
+			wp->flags &= ~PANE_ADOPTED;
 		wp->flags |= PANE_STATUSDRAWN;
 
 		gettimeofday(&wp->dead_time, NULL);

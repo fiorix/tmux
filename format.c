@@ -2256,7 +2256,8 @@ format_cb_pane_dead(struct format_tree *ft)
 	struct window_pane	*wp = ft->wp;
 
 	if (wp != NULL) {
-		if (wp->fd == -1 && (wp->flags & PANE_STATUSREADY))
+		if (wp->fd == -1 &&
+		    (wp->flags & (PANE_STATUSREADY|PANE_ADOPTED)))
 			return (xstrdup("1"));
 		return (xstrdup("0"));
 	}

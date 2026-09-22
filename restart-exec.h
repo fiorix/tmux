@@ -96,6 +96,9 @@ struct server_restart_ops {
 };
 
 const struct server_restart_ops *restart_exec_get_ops(void);
+#ifdef HAVE_SYSTEMD_RESTART
+const struct server_restart_ops *systemd_restart_get_ops(void);
+#endif
 
 int	 restart_checkpoint_create(char **);
 int	 restart_checkpoint_seal(int, const struct ibuf *, char **);

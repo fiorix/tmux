@@ -45,8 +45,8 @@ static struct server_restart_context server_restart_ctx = {
 };
 
 static const struct server_restart_ops	*server_restart_ops;
+static int				 server_restart_adopts_panes;
 
-static void	server_restart_init_ops(void);
 static short	server_restart_pane_events_get(const struct window_pane *);
 static void	server_restart_pane_events_set(struct window_pane *, short);
 static void	server_restart_recovery_wait(void);
@@ -87,11 +87,42 @@ static int	server_restart_unknown_exit_status(void);
  * The one place that names a transport. A second transport would choose here
  * rather than anywhere else in this file.
  */
-static void
-server_restart_init_ops(void)
+void
+server_restart_init(void)
 {
-	if (server_restart_ops == NULL)
-		server_restart_ops = restart_exec_get_ops();
+	if (server_restart_ops != NULL)
+		return;
+#ifdef HAVE_SYSTEMD_RESTART
+	if (systemd_activated()) {
+		server_restart_ops = systemd_restart_get_ops();
+		server_restart_adopts_panes = 1;
+		return;
+	}
+#endif
+	server_restart_ops = restart_exec_get_ops();
+}
+
+int
+server_restart_uses_systemd(void)
+{
+	server_restart_init();
+	return (server_restart_adopts_panes);
+}
+
+static void
+server_restart_mark_adopted(void)
+{
+	struct window		*w;
+	struct window_pane	*wp;
+
+	if (!server_restart_adopts_panes)
+		return;
+	RB_FOREACH(w, windows, &windows) {
+		TAILQ_FOREACH(wp, &w->panes, entry) {
+			if (wp->pid > 0 && (~wp->flags & PANE_STATUSREADY))
+				wp->flags |= PANE_ADOPTED;
+		}
+	}
 }
 
 static short
@@ -655,7 +686,7 @@ server_restart_restore(struct restart_activation *activation, uint64_t flags,
 	char				*local = NULL;
 	int				 fd;
 
-	server_restart_init_ops();
+	server_restart_init();
 
 	*cause = NULL;
 	server_restart_ctx.activation = activation;
@@ -707,6 +738,7 @@ server_restart_restore(struct restart_activation *activation, uint64_t flags,
 	}
 	restart_state_free(state);
 	free(bytes);
+	server_restart_mark_adopted();
 
 	if (server_restart_ops->activation_remove(activation, cause) !=
 	    RESTART_STORE_OK) {
@@ -742,7 +774,7 @@ server_restart_start(char **cause)
 	char					*cleanup_cause = NULL;
 	int					 dirty = 0;
 
-	server_restart_init_ops();
+	server_restart_init();
 
 	*cause = NULL;
 	memset(&tr, 0, sizeof tr);
