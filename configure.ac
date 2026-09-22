@@ -532,6 +532,69 @@ if test x"$enable_systemd" = xyes; then
 	fi
 fi
 AM_CONDITIONAL(HAVE_SYSTEMD, [test "x$found_systemd" = xyes])
+AC_ARG_WITH(
+	systemd-user-unit-dir,
+	AS_HELP_STRING(--with-systemd-user-unit-dir=DIR,
+	    install systemd user units in DIR),
+	[case "$withval" in
+		yes|no|'')
+			AC_MSG_ERROR(--with-systemd-user-unit-dir requires a directory)
+			;;
+		*)
+			SYSTEMD_USER_UNIT_DIR=$withval
+			;;
+	esac],
+	[SYSTEMD_USER_UNIT_DIR=]
+)
+if test "x$found_systemd" = xyes && \
+    test "x$SYSTEMD_USER_UNIT_DIR" = x; then
+	AC_MSG_CHECKING(for systemd user unit directory)
+	SYSTEMD_USER_UNIT_DIR=`$PKG_CONFIG \
+	    --variable=systemduserunitdir systemd 2>/dev/null`
+	if test "x$SYSTEMD_USER_UNIT_DIR" = x; then
+		AC_MSG_ERROR([systemd user unit directory not found; use --with-systemd-user-unit-dir=DIR])
+	fi
+	AC_MSG_RESULT($SYSTEMD_USER_UNIT_DIR)
+fi
+AC_SUBST(SYSTEMD_USER_UNIT_DIR)
+
+SYSTEMD_FILE_DESCRIPTOR_STORE_PRESERVE=
+if test "x$found_systemd" = xyes; then
+	PKG_CHECK_EXISTS(
+		[libsystemd >= 254],
+		[SYSTEMD_FILE_DESCRIPTOR_STORE_PRESERVE=FileDescriptorStorePreserve=yes],
+		[:]
+	)
+fi
+AC_SUBST(SYSTEMD_FILE_DESCRIPTOR_STORE_PRESERVE)
+
+systemd_prefix=$prefix
+test "x$systemd_prefix" = xNONE && systemd_prefix=$ac_default_prefix
+systemd_exec_prefix=$exec_prefix
+if test "x$systemd_exec_prefix" = xNONE; then
+	systemd_exec_prefix=$systemd_prefix
+else
+	case "$systemd_exec_prefix" in
+		'${prefix}'*)
+			systemd_exec_prefix="${systemd_prefix}${systemd_exec_prefix#'${prefix}'}"
+			;;
+	esac
+fi
+case "$bindir" in
+	'${exec_prefix}'*)
+		systemd_bindir="${systemd_exec_prefix}${bindir#'${exec_prefix}'}"
+		;;
+	'${prefix}'*)
+		systemd_bindir="${systemd_prefix}${bindir#'${prefix}'}"
+		;;
+	*)
+		systemd_bindir=$bindir
+		;;
+esac
+SYSTEMD_TMUX_PATH="$systemd_bindir/tmux"
+SYSTEMD_TMUX_EXEC=$(printf '%s\n' "$SYSTEMD_TMUX_PATH" | sed \
+    -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g')
+AC_SUBST(SYSTEMD_TMUX_EXEC)
 AC_ARG_ENABLE(
 	cgroups,
 	AS_HELP_STRING(--disable-cgroups, disable adding panes to new cgroups with systemd)
@@ -1183,5 +1246,5 @@ AC_SUBST(AM_LDFLAGS)
 LDFLAGS="$SAVED_LDFLAGS"
 
 # autoconf should create a Makefile.
-AC_CONFIG_FILES(Makefile)
+AC_CONFIG_FILES([Makefile tmux@.service])
 AC_OUTPUT

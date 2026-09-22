@@ -1,0 +1,13 @@
+[Unit]
+Description=tmux server socket (%i)
+
+[Socket]
+ListenStream=%t/tmux-%U/%i
+DirectoryMode=0700
+SocketMode=0600
+Accept=no
+FileDescriptorName=tmux-server
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
