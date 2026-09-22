@@ -66,6 +66,7 @@ static void	server_signal(int);
 static void	server_child_signal(void);
 static void	server_child_exited(pid_t, int);
 static void	server_child_stopped(pid_t, int);
+static int	server_child_pane_eligible(const struct window_pane *, pid_t);
 
 /* Set marked pane. */
 void
@@ -224,12 +225,16 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 	hooks_build_events();
 	TAILQ_INIT(&message_log);
 	gettimeofday(&start_time, NULL);
+	server_restart_init();
 
 #ifdef HAVE_SYSTEMD
 	if (systemd_activated()) {
 		server_fd = systemd_create_socket(flags,
 		    &server_systemd_activation, &cause);
-		if (server_fd != -1 &&
+		if (server_fd != -1 && server_restart_uses_systemd()) {
+			server_activation = (struct restart_activation *)
+			    server_systemd_activation;
+		} else if (server_fd != -1 &&
 		    systemd_activation_is_restart(server_systemd_activation)) {
 			xasprintf(&cause, "systemd activation error: this "
 			    "server cannot restore a restarted server's state");
@@ -273,21 +278,36 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 
 	/*
 	 * A server handed a checkpoint rebuilds itself from it before accept is
-	 * armed, so no client can see a half restored server. The previous
-	 * server checked that this image can read the checkpoint before it
-	 * committed, so failing here means the panes are lost.
+	 * armed, so no client can see a half restored server. With the exec
+	 * transport the previous server checked that this image can read the
+	 * checkpoint before it committed, so failing here means the panes are
+	 * lost. The service manager keeps its descriptors until a replacement
+	 * has restored them.
 	 */
 	if (server_fd != -1 && server_restart_restore(server_activation, flags,
 	    &restart_cause) != 0) {
 		log_debug("%s: restore failed: %s", __func__, restart_cause);
 		close(server_fd);
 		server_fd = -1;
-		restart_exec_activation_free(server_activation);
+#ifdef HAVE_SYSTEMD
+		if (server_systemd_activation != NULL)
+			systemd_activation_free(server_systemd_activation);
+		else
+#endif
+			restart_exec_activation_free(server_activation);
 		server_activation = NULL;
+#ifdef HAVE_SYSTEMD
+		server_systemd_activation = NULL;
+#endif
 		fprintf(stderr, "%s\n", restart_cause);
 		free(restart_cause);
 		exit(1);
 	}
+#ifdef HAVE_SYSTEMD
+	if (server_fd != -1 && !server_restart_uses_systemd() &&
+	    systemd_ready(&restart_cause) != 0 && restart_cause != NULL)
+		log_debug("%s: %s", __func__, restart_cause);
+#endif
 	free(restart_cause);
 	restart_cause = NULL;
 
@@ -306,10 +326,14 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 			break;
 		server_restart_resume();
 	}
-	restart_exec_activation_free(server_activation);
+#ifdef HAVE_SYSTEMD
+	if (server_systemd_activation != NULL)
+		systemd_activation_free(server_systemd_activation);
+	else
+#endif
+		restart_exec_activation_free(server_activation);
 	server_activation = NULL;
 #ifdef HAVE_SYSTEMD
-	systemd_activation_free(server_systemd_activation);
 	server_systemd_activation = NULL;
 #endif
 	exit(server_restart_exit_status());
@@ -589,6 +613,13 @@ server_child_signal(void)
 	}
 }
 
+static int
+server_child_pane_eligible(const struct window_pane *wp, pid_t pid)
+{
+	return (wp->pid == pid && wp->pid > 0 &&
+	    (wp->flags & (PANE_EMPTY|PANE_STATUSREADY|PANE_ADOPTED)) == 0);
+}
+
 /* Handle exited children. */
 static void
 server_child_exited(pid_t pid, int status)
@@ -604,7 +635,7 @@ server_child_exited(pid_t pid, int status)
 		return;
 	RB_FOREACH_SAFE(w, windows, &windows, w1) {
 		TAILQ_FOREACH(wp, &w->panes, entry) {
-			if (wp->pid == pid) {
+			if (server_child_pane_eligible(wp, pid)) {
 				wp->status = status;
 				wp->flags |= PANE_STATUSREADY;
 
@@ -637,7 +668,7 @@ server_child_stopped(pid_t pid, int status)
 
 	RB_FOREACH(w, windows, &windows) {
 		TAILQ_FOREACH(wp, &w->panes, entry) {
-			if (wp->pid == pid) {
+			if (server_child_pane_eligible(wp, pid)) {
 				if (killpg(pid, SIGCONT) != 0)
 					kill(pid, SIGCONT);
 			}
